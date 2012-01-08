@@ -1,6 +1,7 @@
 module Network.OSM
   (  -- * Types
     TileID
+  , TileCoords(..)
      -- * High Level Operations
   , downloadBestFitTiles
   , osmTileURL
@@ -23,6 +24,7 @@ import Data.Maybe
 import Data.Word
 
 -- | The official OSM tile server.
+osmTileURL :: String
 osmTileURL = "http://tile.openstreetmap.org"
 
 -- |The coordinates associated with any particular GPS location
@@ -49,8 +51,7 @@ tileNumbers latitude longitude zoom =
 secant :: Floating a => a -> a
 secant a = 1 / cos a
 
--- |Computes the rectangular map region to download in order to
--- display all the listed coordinates.
+-- |Computes the rectangular map region to download based on GPS points and a zoom level
 determineTileCoords :: (Lat a, Lon a) => [a] -> Int -> Maybe TileCoords
 determineTileCoords [] _ = Nothing
 determineTileCoords wpts z =
@@ -76,8 +77,7 @@ getZoomDiv x y i
    | otherwise = i
 
 -- | Takes the boundaries of the OSM tiles, and generates
--- [(Int,Int)] containing a list of all OSM tiles that
--- need downloading
+-- a list of the encompassed OSM tiles.
 selectedTiles :: TileCoords -> [[TileID]]
 selectedTiles c = map (\j -> [TID (i,j) | i <- [minX c..maxX c]]) [minY c .. maxY c]
 
@@ -112,8 +112,8 @@ project x y zoom =
       long1 = (-180.0) + fromIntegral x * unit'
   in (lat2,long1,lat1,long1+unit') -- S,W,N,E
   
--- | Takes a WptType, and the OSM tile boundaries
--- and generates (x,y) points to be placed on the 'Image'
+-- | Takes a WptType, the OSM tile boundaries, and a zoom level then
+-- generates (x,y) points to be placed on the Image.
 pixelPosForCoord :: (Lon a, Lat a, Integral t) => [a] -> TileCoords -> Int -> (t, t)
 pixelPosForCoord [] _ _ = (0,0)
 pixelPosForCoord [wpt] tCoord zoom =
@@ -129,6 +129,7 @@ pixelPosForCoord [wpt] tCoord zoom =
 
 -- | The suggested copyright text in accordance with
 -- http://wiki.openstreetmap.org/wiki/Legal_FAQ
+copyrightText :: String
 copyrightText = "Tile images © OpenStreetMap (and) contributors, CC-BY-SA"
 
 -- | Takes the destination directory for the web content,
