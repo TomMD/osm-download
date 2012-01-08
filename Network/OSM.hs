@@ -49,9 +49,8 @@ tileNumbers latitude longitude zoom =
 secant :: Floating a => a -> a
 secant a = 1 / cos a
 
-initCoords :: TileCoords
-initCoords = TileCoords {minX = 100000, maxX = -100000, minY = 100000, maxY = -100000}
-
+-- |Computes the rectangular map region to download in order to
+-- display all the listed coordinates.
 determineTileCoords :: (Lat a, Lon a) => [a] -> Int -> Maybe TileCoords
 determineTileCoords [] _ = Nothing
 determineTileCoords wpts z =
