@@ -128,14 +128,18 @@ pixelPosForCoord [wpt] tCoord zoom =
              in (x,y)
 
 -- | The suggested copyright text in accordance with
--- http://wiki.openstreetmap.org/wiki/Legal_FAQ
+-- <http://wiki.openstreetmap.org/wiki/Legal_FAQ>
 copyrightText :: String
 copyrightText = "Tile images © OpenStreetMap (and) contributors, CC-BY-SA"
 
--- | Takes the destination directory for the web content,
--- the (Trail PtType), and uses the DrawOsm functions
--- to generate an `osm.png' file showing the trail.
-downloadBestFitTiles :: String -> (Lat a, Lon a) => [a] -> IO [[B.ByteString]]
+-- | Takes the tile server base URL,
+-- the set of coordinates that must appear within the map boundaries, and users
+-- the 'downloadTiles' function to acquire all the necessary tiles.
+--
+-- The returned files should all be in an approriate grid for row/column display.
+-- See the test files of Main.hs and Main2.hs for examples of Repa stiching tiles
+-- into a single image or side by side display of individual tiles.
+downloadBestFitTiles :: (Lat a, Lon a) => String -> [a] -> IO [[B.ByteString]]
 downloadBestFitTiles base points = do
   let tiles = determineTileCoords points 16
       zoom = fmap zoomCalc tiles
