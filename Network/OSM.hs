@@ -211,19 +211,19 @@ bestFitCoordinates points =
       (Just coord, Just z) -> (coord,z)
       _                    -> (TileCoords 0 0 0 0,0)
 
-getBestFitTiles :: (Coordinate a) => String -> [a] -> IO [[Either Status B.ByteString]]
-getBestFitTiles base cs = do
+getBestFitTiles :: (Coordinate a) => FilePath -> String -> [a] -> IO [[Either Status B.ByteString]]
+getBestFitTiles f base cs = do
   let (coords,zoom) = bestFitCoordinates cs
       tids = selectedTiles coords
-  getTiles base tids zoom
+  getTiles f base tids zoom
 
-getTiles :: String -> [[TileID]] -> Zoom -> IO [[Either Status B.ByteString]]
-getTiles s ts z = mapM (mapM (\t -> getTile s t z)) ts
+getTiles :: FilePath -> String -> [[TileID]] -> Zoom -> IO [[Either Status B.ByteString]]
+getTiles f s ts z = mapM (mapM (\t -> getTile f s t z)) ts
 
 -- FIXME constantly opening the acid state is probably really dumb.
-getTile :: String -> TileID -> Zoom -> IO (Either Status B.ByteString)
-getTile base t zoom = do
-  st <- openLocalState (TC M.empty)
+getTile :: FilePath -> String -> TileID -> Zoom -> IO (Either Status B.ByteString)
+getTile fp base t zoom = do
+  st <- openLocalStateFrom fp (TC M.empty)
   b <- query st (QueryTC (t,zoom))
   case b of
     Nothing -> do
