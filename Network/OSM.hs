@@ -7,8 +7,10 @@ module Network.OSM
   , TileCoords(..)
   , Zoom
     -- * High-level (cacheing) Operations
-  , OSMConfig
+  , OSMConfig(..)
   , OSMState
+  , OSM
+  , evalOSM
   , getBestFitTiles
   , getTiles
   , getTile
@@ -39,11 +41,12 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 
 -- For the cacheing
+import Control.Monad.IO.Class (MonadIO(..))
+import Control.Concurrent.MonadIO (forkIO)
 import Control.Monad.Reader (ask)
 import Control.Monad.State
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
-import Control.Concurrent.STM.TChan
+import Control.Concurrent.STM.TBChan
 import Data.Acid
 import Data.Char (isDigit)
 import Data.Conduit
@@ -227,59 +230,117 @@ bestFitCoordinates points =
 -- location of the cache, the tile server URL, and the worker threads
 -- the retrieve tiles.
 data OSMConfig = OSMCfg
-                { url    :: TileID -> Zoom -> String
-                , cache  :: FilePath
-                , nrConcurrentDownloads :: Int }
+                { buildUrl    :: TileID -> Zoom -> String  -- ^ The download URL for a given tile
+                , cache       :: FilePath                  -- ^ Path of the tile cache
+                , noCacheAction :: Maybe (TileID -> Zoom -> IO B.ByteString)
+                                                           -- ^ Action to take if the tile is not cached.
+                                                           --   Return 'Just' val for a default value.
+                                                           --   Return 'Nothing' to wait for a tile server.
+                , nrQueuedDownloads     :: Int             -- ^ Max download queue size
+                , nrConcurrentDownloads :: Int }           -- ^ Number of threads the tile downloading
+                                                           --   can concurrently run in.  Tileserver
+                                                           --   admins request this be no more than 2.
 
 data OSMState = OSMSt 
                 { acid        :: AcidState TileCache
-                , neededTiles :: TChan (TileID,Zoom)
+                , neededTiles :: TBChan (TileID,Zoom)
                 , cfg         :: OSMConfig }
 
-newtype MonadOSM a = MOSM { runOSM :: StateT OSMState IO a }
-         deriving (Monad, MonadState OSMState)
+-- |A Monad transformer allowing you acquire OSM maps
+newtype OSM m a = OSM { runOSM :: StateT OSMState m a }
+         deriving (Monad, MonadState OSMState, MonadTrans)
+
+instance (MonadIO m) => MonadIO (OSM m) where
+  liftIO = lift . liftIO
+
+-- |evalOSM allows you to query an OSM server and the local cache.
+-- Take note - the 'OSMConfig' thread limit is enforced per-evalOSM.
+-- Running many evalOSM processes can result in a violation of the
+-- limit and incur admin wrath.
+evalOSM :: MonadIO m => OSMConfig -> OSM m a -> m a
+evalOSM cfg m = do
+  tc <- liftIO $ newTBChanIO (nrQueuedDownloads cfg)
+  acid <- liftIO $ openLocalStateFrom (cache cfg) (TC M.empty)
+  liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg acid tc)
+  let s = OSMSt acid tc cfg
+  evalStateT (runOSM m) s
+
+monitorTileQueue :: OSMConfig -> AcidState TileCache -> TBChan (TileID, Zoom) -> IO ()
+monitorTileQueue cfg acid tc = forever $ do
+  (t,z) <- atomically $ readTBChan tc
+  let addr = buildUrl cfg t z
+  tileE <- downloadTileAndExprTime addr z t
+  case tileE of
+    Left err -> return ()
+    Right (exp,bs)  -> update acid (UpdateTC exp (t,z) bs) >> createCheckpoint acid
 
 -- A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
 defaultConfig :: IO OSMConfig
 defaultConfig = do
   cache <- getDataFileName "TileCache"
-  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache 2
+  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache Nothing 1024 2
 
-getBestFitTiles :: (Coordinate a) => FilePath -> String -> [a] -> IO [[Either Status B.ByteString]]
+getBestFitTiles :: (Coordinate a, MonadIO m)
+                     => FilePath
+                     -> String 
+                     -> [a] -> OSM m [[Either Status B.ByteString]]
 getBestFitTiles f base cs = do
   let (coords,zoom) = bestFitCoordinates cs
       tids = selectedTiles coords
   getTiles f base tids zoom
 
-getTiles :: FilePath -> String -> [[TileID]] -> Zoom -> IO [[Either Status B.ByteString]]
+getTiles :: MonadIO m => FilePath 
+                      -> String 
+                      -> [[TileID]] 
+                      -> Zoom 
+                      -> OSM m [[Either Status B.ByteString]]
 getTiles f s ts z = mapM (mapM (\t -> getTile f s t z)) ts
 
--- FIXME constantly opening the acid state is probably really dumb.
-getTile :: FilePath -> String -> TileID -> Zoom -> IO (Either Status B.ByteString)
+downloadTileAndExprTime ::    String 
+                           -> Zoom 
+                           -> TileID 
+                           -> IO (Either Status (UTCTime,B.ByteString))
+downloadTileAndExprTime base z t = do
+  res <- runResourceT $ newManager >>= \m -> downloadTile' m base z t
+  case res of
+    Right (hdrs,bs) -> do
+      now <- getCurrentTime
+      let maxSec = cacheLength hdrs
+          delTime = addUTCTime (fromIntegral maxSec) now
+      return $ Right (delTime,bs)
+    Left e -> return (Left e)
+
+getTile :: MonadIO m => FilePath -> String -> TileID -> Zoom -> OSM m (Either Status B.ByteString)
 getTile fp base t zoom = do
-  st <- openLocalStateFrom fp (TC M.empty)
-  b <- query st (QueryTC (t,zoom))
+  st  <- gets acid
+  ch  <- gets neededTiles
+  nca <- gets (noCacheAction . cfg)
+  b <- liftIO $ query st (QueryTC (t,zoom))
   case b of
     Nothing -> do
-               res <- runResourceT $ newManager >>= \m -> downloadTile' m base zoom t
-               case res of
-                 Right (hdrs,bs) -> do
-                                now <- getCurrentTime
-                                let maxSec = cacheLength hdrs
-                                    delTime = addUTCTime (fromIntegral maxSec) now
-                                update st (UpdateTC delTime (t,zoom) bs)
-                                createCheckpoint st
-                                closeAcidState st
-                                return (Right bs)
-                 Left err -> closeAcidState st >> return (Left err)
+      case nca of
+        Nothing  -> blockingTileDownloadUpdateCache st
+        Just act -> liftIO $ do
+          atomically $ unGetTBChan ch (t,zoom)
+          liftM Right (act t zoom)
     Just (expTime,x)  -> do
       liftIO $ do
          now <- getCurrentTime
          let exp = expTime < now
-         when exp (forkIO (updateTile fp base t zoom) >> return ())
+         when exp (atomically (tryWriteTBChan ch (t,zoom)) >> return ())
       return (Right x)
-    
+  where
+    blockingTileDownloadUpdateCache st = do
+      res <- liftIO $ downloadTileAndExprTime base zoom t
+      case res of
+           Right (delTime,bs) -> do
+             liftIO $ do
+               update st (UpdateTC delTime (t,zoom) bs)
+               createCheckpoint st
+             return (Right bs)
+           Left err -> return (Left err)
+
 -- FIXME to avoid ticking off the tile server admin we must constrain this
 -- function to no more than two threads.
 updateTile :: FilePath -> String -> TileID -> Zoom -> IO ()
