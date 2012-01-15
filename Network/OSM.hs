@@ -36,7 +36,8 @@ import Data.GPS
 import Data.Maybe
 import Data.Word
 import Network.HTTP.Conduit
-import Network.HTTP.Types (Status,statusOK, ResponseHeaders, parseSimpleQuery)
+import Network.HTTP.Types ( Status, statusOK, ResponseHeaders
+                          , parseSimpleQuery, statusServiceUnavailable)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 
@@ -74,17 +75,21 @@ data TileCoords = TileCoords
                      , maxY :: Int 
                      } 
 
+-- |A TileID, along with a zoom level, uniquely identifies a single
+-- OSM map tile.  The standard size is 256x256 pixels for such a tile.
 data TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Data, Typeable)
 
+-- |An on-disk cache of tiles.  Failure to use a local cache results in
+-- excessive requests to the tile server.  OSM admins might ban such users.
 newtype TileCache = TC (M.Map (TileID,Zoom) (UTCTime,B.ByteString))
   deriving (Data, Typeable)
-           
+
 updateTC :: UTCTime -> (TileID,Zoom) -> B.ByteString -> Update TileCache ()
 updateTC expire tid bs = do
   TC tc <- get
   let tc' = M.insert tid (expire,bs) tc
   put (TC tc')
-  
+
 queryTC :: (TileID,Zoom) -> Query TileCache (Maybe (UTCTime,B.ByteString))
 queryTC tid = do
   TC st <- ask
@@ -93,8 +98,8 @@ queryTC tid = do
 $(deriveSafeCopy 1 'base ''TileID)
 $(deriveSafeCopy 1 'base ''TileCache)
 $(makeAcidic ''TileCache ['updateTC, 'queryTC])
-                                            
--- OSM defined a of converting a coordinate and zoom level to a list of tiles
+
+-- |OSM defined method of converting a coordinate and zoom level to a list of tiles
 tileNumbers :: Double -> Double -> Zoom -> [(Int,Int)]
 tileNumbers latitude longitude zoom = 
              let xtile = ((longitude+180) / 360) * fromInteger (shift (1::Integer) zoom)
@@ -148,6 +153,7 @@ downloadTiles base zoom ts = runResourceT $ do
   man <- newManager
   mapM (mapM (liftM (fmap snd) . downloadTile' man base zoom)) ts
   
+-- |Download a single tile form a given OSM server URL.
 downloadTile :: String -> Zoom -> TileID -> IO (Either Status B.ByteString)
 downloadTile base zoom t = runResourceT $ do
   man <- newManager
@@ -181,11 +187,10 @@ project x y zoom =
       long1 = (-180.0) + fromIntegral x * unit'
   in (lat2,long1,lat1,long1+unit') -- S,W,N,E
   
--- | Takes a WptType, the OSM tile boundaries, and a zoom level then
+-- | Takes a coordinate, the OSM tile boundaries, and a zoom level then
 -- generates (x,y) points to be placed on the Image.
-pixelPosForCoord :: (Coordinate a, Integral t) => [a] -> TileCoords -> Zoom -> (t, t)
-pixelPosForCoord [] _ _ = (0,0)
-pixelPosForCoord [wpt] tCoord zoom =
+pixelPosForCoord :: (Coordinate a, Integral t) => a -> TileCoords -> Zoom -> (t, t)
+pixelPosForCoord wpt tCoord zoom =
              let lat' = lat wpt
                  lon' = lon wpt
                  tile = maximum $ tileNumbers lat' lon' zoom
@@ -237,10 +242,16 @@ data OSMConfig = OSMCfg
                                                            --   Return 'Just' val for a default value.
                                                            --   Return 'Nothing' to wait for a tile server.
                 , nrQueuedDownloads     :: Int             -- ^ Max download queue size
-                , nrConcurrentDownloads :: Int }           -- ^ Number of threads the tile downloading
+                , nrConcurrentDownloads :: Int             -- ^ Number of threads the tile downloading
                                                            --   can concurrently run in.  Tileserver
                                                            --   admins request this be no more than 2.
+                , networkEnabled :: Bool                   -- ^ True if we should use the network to
+                                                           -- download Tiles
+                }
 
+-- |The OSM operations maintain a list of tiles needing refreshed (for
+-- local caching), the state of the local cache, and initial
+-- configuration options.
 data OSMState = OSMSt 
                 { acid        :: AcidState TileCache
                 , neededTiles :: TBChan (TileID,Zoom)
@@ -265,6 +276,7 @@ evalOSM cfg m = do
   let s = OSMSt acid tc cfg
   evalStateT (runOSM m) s
 
+-- Pulls requested tiles off the queue, downloads them, and adds them to the cache.
 monitorTileQueue :: OSMConfig -> AcidState TileCache -> TBChan (TileID, Zoom) -> IO ()
 monitorTileQueue cfg acid tc = forever $ do
   (t,z) <- atomically $ readTBChan tc
@@ -274,13 +286,14 @@ monitorTileQueue cfg acid tc = forever $ do
     Left err -> return ()
     Right (exp,bs)  -> update acid (UpdateTC exp (t,z) bs) >> createCheckpoint acid
 
--- A default configuration using the main OSM server as a tile server
+-- |A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
 defaultConfig :: IO OSMConfig
 defaultConfig = do
   cache <- getDataFileName "TileCache"
-  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache Nothing 1024 2
+  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache Nothing 1024 2 True
 
+-- |Like 'downloadBestFitTiles' but uses the cached copies when available.
 getBestFitTiles :: (Coordinate a, MonadIO m)
                      => FilePath
                      -> String 
@@ -290,6 +303,7 @@ getBestFitTiles f base cs = do
       tids = selectedTiles coords
   getTiles f base tids zoom
 
+-- |Like 'downloadTiles' but uses the cached copies when available
 getTiles :: MonadIO m => FilePath 
                       -> String 
                       -> [[TileID]] 
@@ -311,6 +325,11 @@ downloadTileAndExprTime base z t = do
       return $ Right (delTime,bs)
     Left e -> return (Left e)
 
+-- |Like 'downloadTile' but uses a cached copy when available.
+-- Downloaded copies are added to the cache.
+-- 
+-- When the cached copy is out of date it will still be returned but a
+-- new copy will be downloaded and added to the cache concurrently.
 getTile :: MonadIO m => FilePath -> String -> TileID -> Zoom -> OSM m (Either Status B.ByteString)
 getTile fp base t zoom = do
   st  <- gets acid
@@ -320,7 +339,7 @@ getTile fp base t zoom = do
   case b of
     Nothing -> do
       case nca of
-        Nothing  -> blockingTileDownloadUpdateCache st
+        Nothing  -> blockingTileDownloadUpdateCache
         Just act -> liftIO $ do
           atomically $ unGetTBChan ch (t,zoom)
           liftM Right (act t zoom)
@@ -331,32 +350,20 @@ getTile fp base t zoom = do
          when exp (atomically (tryWriteTBChan ch (t,zoom)) >> return ())
       return (Right x)
   where
-    blockingTileDownloadUpdateCache st = do
-      res <- liftIO $ downloadTileAndExprTime base zoom t
-      case res of
+    blockingTileDownloadUpdateCache = do
+      st  <- gets acid
+      net <- gets (networkEnabled . cfg)
+      if net 
+       then do
+        res <- liftIO $ downloadTileAndExprTime base zoom t
+        case res of
            Right (delTime,bs) -> do
              liftIO $ do
                update st (UpdateTC delTime (t,zoom) bs)
                createCheckpoint st
              return (Right bs)
            Left err -> return (Left err)
-
--- FIXME to avoid ticking off the tile server admin we must constrain this
--- function to no more than two threads.
-updateTile :: FilePath -> String -> TileID -> Zoom -> IO ()
-updateTile fp base t zoom = do
-  res <- runResourceT $ newManager >>= \m -> downloadTile' m base zoom t
-  case res of
-    Left err -> return ()
-    Right (hdrs,bs) -> do
-      now <- getCurrentTime
-      let exp = cacheLength hdrs
-          delTime = addUTCTime (fromIntegral exp) now
-      st <- openLocalStateFrom fp (TC M.empty)
-      update st (UpdateTC delTime (t,zoom) bs)
-      createCheckpoint st
-      closeAcidState st
-      
+       else return (Left statusServiceUnavailable)
 
 -- | Determine the lenth of time to cache an HTTP response (in seconds)
 cacheLength :: ResponseHeaders -> Int

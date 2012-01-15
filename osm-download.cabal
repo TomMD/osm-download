@@ -50,7 +50,8 @@ Library
   -- Packages needed in order to build this package.
   Build-depends:       base >= 4 && < 5
                      , conduit >= 0.0 && < 0.1
-                     , http-conduit >= 1.1 && < 1.2, http-types >= 0.6 && < 0.7
+                     , http-conduit >= 1.1 && < 1.2
+                     , http-types >= 0.6 && < 0.7
                      , bytestring, gps >= 1.0.1 && < 1.1
                      , containers >= 0.3 && < 0.5
                      , acid-state >= 0.6 && < 0.7
