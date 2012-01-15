@@ -231,7 +231,8 @@ getTile base t zoom = do
                case res of
                  Right bs -> do update st (UpdateTC ((t,zoom),bs))
                                 createCheckpoint st
+                                closeAcidState st
                                 return (Right bs)
-                 Left err -> return (Left err)
+                 Left err -> closeAcidState st >> return (Left err)
     Just x  -> return (Right x)
 

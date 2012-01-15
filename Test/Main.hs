@@ -7,6 +7,7 @@ import qualified Data.ByteString as B
 import Network.OSM
 import Data.GPS
 
+import Control.Monad
 import System.IO
 import Data.Array.Repa.IO.DevIL
 import qualified Data.Array.Repa as R
@@ -20,14 +21,14 @@ main = do
     [latS,lonS] -> 
       let lat = realToFrac (read latS :: Double)
           lon = realToFrac (read lonS :: Double)
-      in run [ptType lat lon Nothing Nothing]
+      in run [pt lat lon Nothing Nothing]
     _ -> putStr
            $  unlines [ "usage: bitmap <file.png>"
                       , "  file.png should be a PNG file (32-bit RGBA)"]
 
 run pts
- = do files <- downloadBestFitTiles osmTileURL pts
-      arrs <- mapM (mapM stupidConversion) files
+ = do files <- liftM (map $ map $ either (error . show) id)(downloadBestFitTiles osmTileURL pts)
+      arrs <- (mapM (mapM stupidConversion) files)
       let arr = joinRows arrs
           (c,r,picture) = repaToPicture True arr
       display (FullScreen (1280,1024)) white picture
