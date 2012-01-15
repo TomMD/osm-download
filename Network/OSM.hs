@@ -18,6 +18,7 @@ module Network.OSM
     -- * Network Operations
   , downloadBestFitTiles
   , osmTileURL
+  -- * Helper Functions
   , pixelPosForCoord
   -- * Low level and helper functions
   , determineTileCoords
@@ -30,24 +31,23 @@ module Network.OSM
 
 import Control.Monad
 import Control.Monad.Base (liftBase)
-import Control.Monad.IO.Class (liftIO)
 import Data.Bits
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as L
 import Data.GPS
 import Data.Maybe
 import Data.Word
 import Network.HTTP.Conduit
 import Network.HTTP.Types ( Status, statusOK, ResponseHeaders
                           , parseSimpleQuery, statusServiceUnavailable)
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Lazy as L
 
 -- For the cacheing
-import Control.Monad.IO.Class (MonadIO(..))
 import Control.Concurrent.MonadIO (forkIO)
-import Control.Monad.Reader (ask)
-import Control.Monad.State
 import Control.Concurrent.STM
 import Control.Concurrent.STM.TBChan
+import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad.Reader (ask)
+import Control.Monad.State
 import Data.Acid
 import Data.Char (isDigit)
 import Data.Conduit
@@ -55,9 +55,9 @@ import Data.Data
 import Data.SafeCopy
 import Data.Time
 import Data.Typeable
+import Paths_osm_download
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map as M
-import Paths_osm_download
 
 type Zoom = Int
 
@@ -99,14 +99,19 @@ $(deriveSafeCopy 1 'base ''TileID)
 $(deriveSafeCopy 1 'base ''TileCache)
 $(makeAcidic ''TileCache ['updateTC, 'queryTC])
 
+tileNumbers :: Integral t => Double -> Double -> Zoom -> [(t, t)]
+tileNumbers t g z =
+  let (a,b) = tileNumbers' t g z
+      bounds x = [ceiling x, floor x]
+  in [(xt,yt) | xt <- bounds a, yt <- bounds b]
+
 -- |OSM defined method of converting a coordinate and zoom level to a list of tiles
-tileNumbers :: Double -> Double -> Zoom -> [(Int,Int)]
-tileNumbers latitude longitude zoom = 
+tileNumbers' :: Double -> Double -> Zoom -> (Double,Double)
+tileNumbers' latitude longitude zoom = 
              let xtile = ((longitude+180) / 360) * fromInteger (shift (1::Integer) zoom)
                  tmp = log (tan (latitude*pi / 180) + secant (latitude * pi / 180))
                  ytile = ((1-tmp / pi) / 2.0) * fromInteger (shift (1::Integer) zoom)
-                 bounds x = [ceiling x, floor x]
-             in [(xt,yt) | xt <- bounds xtile, yt <- bounds ytile]
+             in (xtile,ytile)
 
 secant :: Floating a => a -> a
 secant a = 1 / cos a
@@ -172,10 +177,10 @@ projectMercToLat :: Floating a => a -> a
 projectMercToLat rely = (180 / pi) * atan (sinh rely)
 
 -- | Used by @pixelPosForCoord@ for N,S,E,W coordinates for (x,y) values
-project :: Int -> Int -> Zoom -> (Double,Double,Double,Double)
+project :: Double -> Double -> Zoom -> (Double,Double,Double,Double)
 project x y zoom = 
   let unit = 1.0 / (2.0 ** fromIntegral zoom)
-      rely1 = fromIntegral y * unit
+      rely1 = y * unit
       rely2 = rely1 + unit
       limity = pi
       rangey = 2.0 * limity
@@ -184,7 +189,7 @@ project x y zoom =
       lat1 = projectMercToLat rely1'
       lat2 = projectMercToLat rely2'
       unit' = 360.0 / (2.0 ** fromIntegral zoom)
-      long1 = (-180.0) + fromIntegral x * unit'
+      long1 = (-180.0) + x * unit'
   in (lat2,long1,lat1,long1+unit') -- S,W,N,E
   
 -- | Takes a coordinate, the OSM tile boundaries, and a zoom level then
@@ -193,12 +198,12 @@ pixelPosForCoord :: (Coordinate a, Integral t) => a -> TileCoords -> Zoom -> (t,
 pixelPosForCoord wpt tCoord zoom =
              let lat' = lat wpt
                  lon' = lon wpt
-                 tile = maximum $ tileNumbers lat' lon' zoom
-                 xoffset = (fst tile - minX tCoord) * 256
-                 yoffset = (snd tile - minY tCoord) * 256
+                 tile = tileNumbers' lat' lon' zoom
+                 xoffset = (fst tile - fromIntegral (minX tCoord)) * 256
+                 yoffset = (snd tile - fromIntegral (minY tCoord)) * 256
                  (south,west,north,east) = (uncurry project tile zoom)
-                 x = round $ (lon' - west) * 256.0 / (east - west) + fromIntegral xoffset
-                 y = round $ (lat' - north) * 256.0 / (south - north) + fromIntegral yoffset
+                 x = round $ (lon' - west) * 256.0 / (east - west) + xoffset
+                 y = round $ (lat' - north) * 256.0 / (south - north) + yoffset
              in (x,y)
 
 -- | The suggested copyright text in accordance with
