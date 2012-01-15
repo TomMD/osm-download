@@ -57,7 +57,9 @@ Library
                      , safecopy >= 0.6 && < 0.7
                      , mtl >= 2.0 && < 2.1
                      , transformers-base >= 0.4 && < 0.5
-  
+                     , transformers >= 0.2 && < 0.3
+                     , time >= 1.2 && < 1.3
+                     , stm >= 2.2 && < 2.3 
   -- Modules not exported by this package.
   -- Other-modules:       
   

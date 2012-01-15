@@ -27,8 +27,8 @@ main = do
                       , "  file.png should be a PNG file (32-bit RGBA)"]
 
 run pts
- = do files <- liftM (map $ map $ either (error . show) id) (getBestFitTiles osmTileURL pts)
-      arrs <- (mapM (mapM stupidConversion) files)
+ = do files <- liftM (map $ map $ either (error . show) id) (getBestFitTiles "./state" osmTileURL pts)
+      arrs <- mapM (mapM stupidConversion) files
       let arr = joinRows arrs
           (c,r,picture) = repaToPicture True arr
       display (FullScreen (1280,1024)) white picture

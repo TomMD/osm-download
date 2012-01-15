@@ -1,13 +1,18 @@
-{-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable, FlexibleInstances #-}
+{-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable,
+    FlexibleInstances, MultiParamTypeClasses, OverloadedStrings 
+    , GeneralizedNewtypeDeriving #-}
 module Network.OSM
   (  -- * Types
     TileID
   , TileCoords(..)
   , Zoom
     -- * High-level (cacheing) Operations
+  , OSMConfig
+  , OSMState
   , getBestFitTiles
   , getTiles
   , getTile
+  , defaultConfig
     -- * Network Operations
   , downloadBestFitTiles
   , osmTileURL
@@ -21,26 +26,34 @@ module Network.OSM
   , copyrightText
   )where
 
-import Data.GPS
-import Network.HTTP.Conduit
-import Network.HTTP.Types (Status,statusOK)
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Lazy as L
 import Control.Monad
 import Control.Monad.Base (liftBase)
+import Control.Monad.IO.Class (liftIO)
 import Data.Bits
+import Data.GPS
 import Data.Maybe
 import Data.Word
+import Network.HTTP.Conduit
+import Network.HTTP.Types (Status,statusOK, ResponseHeaders, parseSimpleQuery)
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as L
 
 -- For the cacheing
-import Data.Data
-import Data.Typeable
-import Data.Acid
-import Data.SafeCopy
-import qualified Data.Map as M
-import Control.Monad.State (MonadState(..))
 import Control.Monad.Reader (ask)
+import Control.Monad.State
+import Control.Concurrent (forkIO)
+import Control.Concurrent.STM
+import Control.Concurrent.STM.TChan
+import Data.Acid
+import Data.Char (isDigit)
 import Data.Conduit
+import Data.Data
+import Data.SafeCopy
+import Data.Time
+import Data.Typeable
+import qualified Data.ByteString.Char8 as BC
+import qualified Data.Map as M
+import Paths_osm_download
 
 type Zoom = Int
 
@@ -60,21 +73,19 @@ data TileCoords = TileCoords
 
 data TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Data, Typeable)
 
-newtype TileCache = TC (M.Map (TileID,Zoom) B.ByteString)
+newtype TileCache = TC (M.Map (TileID,Zoom) (UTCTime,B.ByteString))
   deriving (Data, Typeable)
            
-updateTC :: ((TileID,Zoom),B.ByteString) -> Update TileCache ()
-updateTC (tid,bs) = do
+updateTC :: UTCTime -> (TileID,Zoom) -> B.ByteString -> Update TileCache ()
+updateTC expire tid bs = do
   TC tc <- get
-  let tc' = M.insert tid bs tc
+  let tc' = M.insert tid (expire,bs) tc
   put (TC tc')
   
-queryTC :: (TileID,Zoom) -> Query TileCache (Maybe B.ByteString)
+queryTC :: (TileID,Zoom) -> Query TileCache (Maybe (UTCTime,B.ByteString))
 queryTC tid = do
   TC st <- ask
-  case M.lookup tid st of
-    Nothing -> return Nothing
-    Just t  -> return (Just t)
+  return $ M.lookup tid st
 
 $(deriveSafeCopy 1 'base ''TileID)
 $(deriveSafeCopy 1 'base ''TileCache)
@@ -132,20 +143,20 @@ urlStr base xTile yTile zoom = base ++"/"++show zoom++"/"++show xTile++"/"++show
 downloadTiles :: String -> Zoom -> [[TileID]] -> IO [[Either Status B.ByteString]]
 downloadTiles base zoom ts = runResourceT $ do
   man <- newManager
-  mapM (mapM (downloadTile' man base zoom)) ts
+  mapM (mapM (liftM (fmap snd) . downloadTile' man base zoom)) ts
   
 downloadTile :: String -> Zoom -> TileID -> IO (Either Status B.ByteString)
 downloadTile base zoom t = runResourceT $ do
   man <- newManager
-  downloadTile' man base zoom t
+  liftM (fmap snd) (downloadTile' man base zoom t)
 
-downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status B.ByteString)
+downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status (ResponseHeaders,B.ByteString))
 downloadTile' man base zoom t@(TID (x, y)) = do
   let packIt = B.concat . L.toChunks
   url' <- liftBase (parseUrl (urlStr base x y zoom))
   rsp <- httpLbs url' man
   if statusCode rsp == statusOK
-    then return (Right $ packIt (responseBody rsp))
+    then return (Right (responseHeaders rsp, packIt (responseBody rsp)))
     else return (Left $ statusCode rsp)
 
 projectMercToLat :: Floating a => a -> a
@@ -211,6 +222,30 @@ bestFitCoordinates points =
       (Just coord, Just z) -> (coord,z)
       _                    -> (TileCoords 0 0 0 0,0)
 
+
+-- |The cacheing operations run in their own monad that describe the
+-- location of the cache, the tile server URL, and the worker threads
+-- the retrieve tiles.
+data OSMConfig = OSMCfg
+                { url    :: TileID -> Zoom -> String
+                , cache  :: FilePath
+                , nrConcurrentDownloads :: Int }
+
+data OSMState = OSMSt 
+                { acid        :: AcidState TileCache
+                , neededTiles :: TChan (TileID,Zoom)
+                , cfg         :: OSMConfig }
+
+newtype MonadOSM a = MOSM { runOSM :: StateT OSMState IO a }
+         deriving (Monad, MonadState OSMState)
+
+-- A default configuration using the main OSM server as a tile server
+-- and a cabal-generated directory for the cache directory
+defaultConfig :: IO OSMConfig
+defaultConfig = do
+  cache <- getDataFileName "TileCache"
+  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache 2
+
 getBestFitTiles :: (Coordinate a) => FilePath -> String -> [a] -> IO [[Either Status B.ByteString]]
 getBestFitTiles f base cs = do
   let (coords,zoom) = bestFitCoordinates cs
@@ -227,12 +262,45 @@ getTile fp base t zoom = do
   b <- query st (QueryTC (t,zoom))
   case b of
     Nothing -> do
-               res <- downloadTile base zoom t
+               res <- runResourceT $ newManager >>= \m -> downloadTile' m base zoom t
                case res of
-                 Right bs -> do update st (UpdateTC ((t,zoom),bs))
+                 Right (hdrs,bs) -> do
+                                now <- getCurrentTime
+                                let maxSec = cacheLength hdrs
+                                    delTime = addUTCTime (fromIntegral maxSec) now
+                                update st (UpdateTC delTime (t,zoom) bs)
                                 createCheckpoint st
                                 closeAcidState st
                                 return (Right bs)
                  Left err -> closeAcidState st >> return (Left err)
-    Just x  -> return (Right x)
+    Just (expTime,x)  -> do
+      liftIO $ do
+         now <- getCurrentTime
+         let exp = expTime < now
+         when exp (forkIO (updateTile fp base t zoom) >> return ())
+      return (Right x)
+    
+-- FIXME to avoid ticking off the tile server admin we must constrain this
+-- function to no more than two threads.
+updateTile :: FilePath -> String -> TileID -> Zoom -> IO ()
+updateTile fp base t zoom = do
+  res <- runResourceT $ newManager >>= \m -> downloadTile' m base zoom t
+  case res of
+    Left err -> return ()
+    Right (hdrs,bs) -> do
+      now <- getCurrentTime
+      let exp = cacheLength hdrs
+          delTime = addUTCTime (fromIntegral exp) now
+      st <- openLocalStateFrom fp (TC M.empty)
+      update st (UpdateTC delTime (t,zoom) bs)
+      createCheckpoint st
+      closeAcidState st
+      
 
+-- | Determine the lenth of time to cache an HTTP response (in seconds)
+cacheLength :: ResponseHeaders -> Int
+cacheLength hdrs =
+  let v = lookup "Cache-Control" hdrs
+      c = fmap parseSimpleQuery v
+      age = join . fmap (lookup "max-age") $ c
+  in fromMaybe (7 * 24 * 60 * 60) (fmap (read . filter isDigit . ('0' :) . BC.unpack) $ age)
