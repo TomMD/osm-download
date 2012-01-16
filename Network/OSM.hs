@@ -2,14 +2,15 @@
     FlexibleInstances, MultiParamTypeClasses, OverloadedStrings 
     , GeneralizedNewtypeDeriving #-}
 module Network.OSM
-  (  -- * Types
-    TileID
+  (  -- * Basic Types
+    TileID(..)
   , TileCoords(..)
   , Zoom
-    -- * High-level (cacheing) Operations
+    -- * Types for tile cacheing
   , OSMConfig(..)
   , OSMState
   , OSM
+    -- * High-level (cacheing) Operations
   , evalOSM
   , getBestFitTiles
   , getTiles
@@ -17,14 +18,14 @@ module Network.OSM
   , defaultConfig
     -- * Network Operations
   , downloadBestFitTiles
+  , downloadTiles
+  , downloadTile
   , osmTileURL
   -- * Helper Functions
   , pixelPosForCoord
-  -- * Low level and helper functions
+  , selectTilesWithFixedDimensions
   , determineTileCoords
   , selectedTiles
-  , downloadTiles
-  , downloadTile
   -- * Legal
   , copyrightText
   )where
@@ -73,7 +74,7 @@ data TileCoords = TileCoords
                      , maxX :: Int  
                      , minY :: Int  
                      , maxY :: Int 
-                     } 
+                     } deriving (Eq, Ord, Show)
 
 -- |A TileID, along with a zoom level, uniquely identifies a single
 -- OSM map tile.  The standard size is 256x256 pixels for such a tile.
@@ -115,6 +116,18 @@ tileNumbers' latitude longitude zoom =
 
 secant :: Floating a => a -> a
 secant a = 1 / cos a
+
+-- |Given a width, height and center, compute the tiles needed to fill the display
+selectTilesWithFixedDimensions :: (Coordinate a) => (Int,Int) -> a -> Zoom -> [[TileID]]
+selectTilesWithFixedDimensions (w,h) center z =
+  let (x,y) = tileNumbers' (lat center) (lon center) z
+      nrColumns = ceiling $ fromIntegral w / 256
+      nrRows    = ceiling $ fromIntegral h / 256
+      -- FIXME hardcoding the tile server tile pixel width
+  in take nrRows $ map (take nrColumns) $ 
+       [ [ TID (truncate xp, truncate yp) | xp <- [x..]] 
+         | yp <- [y..] ] 
+       -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
 -- |Computes the rectangular map region to download based on GPS points and a zoom level
 determineTileCoords :: (Coordinate a) => [a] -> Zoom -> Maybe TileCoords
