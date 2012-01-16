@@ -346,7 +346,7 @@ getTile fp base t zoom = do
       case nca of
         Nothing  -> blockingTileDownloadUpdateCache
         Just act -> liftIO $ do
-          atomically $ unGetTBChan ch (t,zoom)
+          atomically $ writeTBChan ch (t,zoom)
           liftM Right (act t zoom)
     Just (expTime,x)  -> do
       liftIO $ do
