@@ -1,6 +1,6 @@
 {-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable,
     FlexibleInstances, MultiParamTypeClasses, OverloadedStrings 
-    , GeneralizedNewtypeDeriving #-}
+    , GeneralizedNewtypeDeriving, FlexibleContexts #-}
 module Network.OSM
   (  -- * Basic Types
     TileID(..)
@@ -15,7 +15,7 @@ module Network.OSM
   , getBestFitTiles
   , getTiles
   , getTile
-  , defaultConfig
+  , defaultOSMConfig
     -- * Network Operations
   , downloadBestFitTiles
   , downloadTiles
@@ -253,9 +253,9 @@ bestFitCoordinates points =
 -- location of the cache, the tile server URL, and the worker threads
 -- the retrieve tiles.
 data OSMConfig = OSMCfg
-                { buildUrl    :: TileID -> Zoom -> String  -- ^ The download URL for a given tile
+                { baseUrl      :: String
                 , cache       :: FilePath                  -- ^ Path of the tile cache
-                , noCacheAction :: Maybe (TileID -> Zoom -> IO B.ByteString)
+                , noCacheAction :: Maybe (TileID -> Zoom -> IO (Either Status B.ByteString))
                                                            -- ^ Action to take if the tile is not cached.
                                                            --   Return 'Just' val for a default value.
                                                            --   Return 'Nothing' to wait for a tile server.
@@ -277,7 +277,7 @@ data OSMState = OSMSt
 
 -- |A Monad transformer allowing you acquire OSM maps
 newtype OSM m a = OSM { runOSM :: StateT OSMState m a }
-         deriving (Monad, MonadState OSMState, MonadTrans)
+         deriving (Monad, MonadTrans, MonadState OSMState)
 
 instance (MonadIO m) => MonadIO (OSM m) where
   liftIO = lift . liftIO
@@ -306,28 +306,28 @@ monitorTileQueue cfg acid tc = forever $ do
 
 -- |A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
-defaultConfig :: IO OSMConfig
-defaultConfig = do
+defaultOSMConfig :: IO OSMConfig
+defaultOSMConfig = do
   cache <- getDataFileName "TileCache"
-  return $ OSMCfg (\(TID (x,y)) z -> urlStr osmTileURL x y z) cache Nothing 1024 2 True
+  return $ OSMCfg osmTileURL cache Nothing 1024 2 True
+
+buildUrl :: OSMConfig -> TileID -> Zoom -> String
+buildUrl cfg (TID (x,y)) z = urlStr (baseUrl cfg) x y z
 
 -- |Like 'downloadBestFitTiles' but uses the cached copies when available.
 getBestFitTiles :: (Coordinate a, MonadIO m)
-                     => FilePath
-                     -> String 
-                     -> [a] -> OSM m [[Either Status B.ByteString]]
-getBestFitTiles f base cs = do
+                     => [a] -> OSM m [[Either Status B.ByteString]]
+getBestFitTiles cs = do
   let (coords,zoom) = bestFitCoordinates cs
       tids = selectedTiles coords
-  getTiles f base tids zoom
+  getTiles tids zoom
 
 -- |Like 'downloadTiles' but uses the cached copies when available
-getTiles :: MonadIO m => FilePath 
-                      -> String 
-                      -> [[TileID]] 
-                      -> Zoom 
-                      -> OSM m [[Either Status B.ByteString]]
-getTiles f s ts z = mapM (mapM (\t -> getTile f s t z)) ts
+getTiles :: (MonadIO m)
+            => [[TileID]] 
+            -> Zoom 
+            -> OSM m [[Either Status B.ByteString]]
+getTiles ts z = mapM (mapM (\t -> getTile t z)) ts
 
 downloadTileAndExprTime ::    String 
                            -> Zoom 
@@ -348,8 +348,8 @@ downloadTileAndExprTime base z t = do
 -- 
 -- When the cached copy is out of date it will still be returned but a
 -- new copy will be downloaded and added to the cache concurrently.
-getTile :: MonadIO m => FilePath -> String -> TileID -> Zoom -> OSM m (Either Status B.ByteString)
-getTile fp base t zoom = do
+getTile :: (MonadIO m) => TileID -> Zoom -> OSM m (Either Status B.ByteString)
+getTile t zoom = do
   st  <- gets acid
   ch  <- gets neededTiles
   nca <- gets (noCacheAction . cfg)
@@ -360,7 +360,7 @@ getTile fp base t zoom = do
         Nothing  -> blockingTileDownloadUpdateCache
         Just act -> liftIO $ do
           atomically $ writeTBChan ch (t,zoom)
-          liftM Right (act t zoom)
+          act t zoom
     Just (expTime,x)  -> do
       liftIO $ do
          now <- getCurrentTime
@@ -371,6 +371,7 @@ getTile fp base t zoom = do
     blockingTileDownloadUpdateCache = do
       st  <- gets acid
       net <- gets (networkEnabled . cfg)
+      base <- gets (baseUrl . cfg)
       if net 
        then do
         res <- liftIO $ downloadTileAndExprTime base zoom t
