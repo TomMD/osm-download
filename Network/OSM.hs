@@ -295,15 +295,27 @@ evalOSM m cfg = do
   let s = OSMSt acid tc cfg
   evalStateT (runOSM m) s
 
--- Pulls requested tiles off the queue, downloads them, and adds them to the cache.
+-- Pulls requested tiles off the queue, downloads them, and adds them
+-- to the cache.  We need to re-check the cache to make sure someone
+-- hasn't already inserted it while the item was queued.  We leave the
+-- possibility that it is being downloaded in parallel by another
+-- 'monitorTileQueue' as acceptable duplication of work.
 monitorTileQueue :: OSMConfig -> AcidState TileCache -> TBChan (TileID, Zoom) -> IO ()
 monitorTileQueue cfg acid tc = forever $ do
   (t,z) <- atomically $ readTBChan tc
-  let addr = buildUrl cfg t z
-  tileE <- downloadTileAndExprTime addr z t
-  case tileE of
-    Left err -> return ()
-    Right (exp,bs)  -> update acid (UpdateTC exp (t,z) bs) >> createCheckpoint acid
+  b <- liftIO $ query acid (QueryTC (t,z))
+  case b of
+    Nothing -> doDownload t z
+    Just (exp,_) -> do
+      now <- getCurrentTime
+      when (exp < now) (doDownload t z)
+ where  
+   doDownload t z = do
+     let addr = buildUrl cfg t z
+     tileE <- downloadTileAndExprTime addr z t
+     case tileE of
+       Left err -> return ()
+       Right (exp,bs)  -> update acid (UpdateTC exp (t,z) bs) >> createCheckpoint acid
 
 -- |A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
