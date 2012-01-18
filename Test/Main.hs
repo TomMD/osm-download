@@ -1,6 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
 import Graphics.Gloss
-import Graphics.Gloss.DevIL
 import System.IO.Temp
 import System.Environment
 import qualified Data.ByteString as B
@@ -9,9 +8,10 @@ import Data.GPS
 
 import Control.Monad
 import System.IO
-import Data.Array.Repa.IO.DevIL
+import Codec.Picture.Repa
 import qualified Data.Array.Repa as R
 import Data.Array.Repa (Array, DIM3, Z(..), (:.)(..), extent, reshape)
+import qualified Data.Array.Repa.ByteString as RB
 import Data.Word
 import qualified Data.List
 
@@ -27,47 +27,24 @@ main = do
                       , "  file.png should be a PNG file (32-bit RGBA)"]
 
 run pts
- = do files <- liftM (map $ map $ either (error . show) id) (getBestFitTiles "./state" osmTileURL pts)
-      arrs <- mapM (mapM stupidConversion) files
-      let arr = joinRows arrs
-          (c,r,picture) = repaToPicture True arr
+ = do files <- liftM (map $ map $ either (error . show) id) (evalOSM (getBestFitTiles pts) =<< defaultOSMConfig)
+      let arrs = map (map $ imgData . either (error .show) id . decodeImageRGBA) files
+      let arr = map (map $ (\(_,_,p) -> p) . repaToPicture True) arrs
+          picture = gridToPicture arr
       display (FullScreen (1280,1024)) white picture
 
-joinRows :: [[Array DIM3 Word8]] -> (Array DIM3 Word8)
-joinRows fs2D =
-  let rows = map joinColumns fs2D
-  in case rows of
-      (x:xs) -> foldl trav x xs
-      [] -> error "No rows!"
+repaToPicture :: Bool -> Array DIM3 Word8 -> (Int, Int, Picture)
+repaToPicture b arr = (col, row, bitmapOfByteString row col (toBS arr) b)
   where
-  trav b a = R.traverse a ext lkup
-    where ext (Z :. rowA :. colA :. chanA) = Z :. rowA + rowB :. colA :. chanA
-          (Z :. rowB  :. _ :. _) = extent b
-          (Z :. rowA' :. _ :. _) = extent a
-          lkup f idx@(Z :. r :. c :. n)
-             | r >= rowA' = b R.! (Z :. r - rowA' :. c :. n)
-             | otherwise = a R.! idx
+  e@(Z :. col :. row :. chan) = extent arr
+  order (Z :. oldCol :. oldRow :. oldChan) = Z :. oldCol :. oldRow :. oldChan
+  toBS = RB.toByteString -- . backpermute e order
 
-joinColumns :: [Array DIM3 Word8] -> Array DIM3 Word8
-joinColumns tiles =
-  case tiles of
-    (x:xs) -> foldl trav x xs
-    []     -> error "No Tiles!"
-  where
-  trav a b = R.traverse a ext lkup
-    where ext (Z :. rowA :. colA :. chanA) = Z :. colA :. rowA + rowB :. chanA
-          (Z :. rowB  :. _ :. _) = extent b
-          (Z :. _ :. colA' :. _) = extent a
-          lkup f idx@(Z :. r :. c :. n)
-             | c >= colA' = b R.! (Z :.  r :. c - colA' :. n)
-             | otherwise = a R.! idx
-
--- We don't have a library to read in-memory buffers of PNG (colormap!) images.
-stupidConversion :: B.ByteString -> IO (Array DIM3 Word8)
-stupidConversion bs = do
-  withSystemTempDirectory "testTiles" $ \path -> do
-  hdl <- openFile (path ++ "/blah") WriteMode
-  B.hPutStr hdl bs
-  hClose hdl
-  !pic <- readRepaImage (path ++ "/blah")
-  return pic
+gridToPicture :: [[Picture]] -> Picture
+gridToPicture arrs =
+  let rows = map (\(r,a) -> Translate (r*(-256)) 0 (adjustColumns a)) (zip [0..] arrs)
+      adjustColumns :: [Picture] -> Picture
+      adjustColumns = Pictures
+                    . map (\(c,a) -> Translate 0 (c*(256)) a)
+                    . zip [0..]
+  in Pictures rows

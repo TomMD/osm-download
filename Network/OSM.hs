@@ -78,7 +78,7 @@ data TileCoords = TileCoords
 
 -- |A TileID, along with a zoom level, uniquely identifies a single
 -- OSM map tile.  The standard size is 256x256 pixels for such a tile.
-data TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Data, Typeable)
+newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Data, Typeable)
 
 -- |An on-disk cache of tiles.  Failure to use a local cache results in
 -- excessive requests to the tile server.  OSM admins might ban such users.
@@ -106,12 +106,13 @@ tileNumbers t g z =
       bounds x = [ceiling x, floor x]
   in [(xt,yt) | xt <- bounds a, yt <- bounds b]
 
--- |OSM defined method of converting a coordinate and zoom level to a list of tiles
+-- |OSM defined method of converting a coordinate and zoom level to a tile
 tileNumbers' :: Double -> Double -> Zoom -> (Double,Double)
 tileNumbers' latitude longitude zoom = 
-             let xtile = ((longitude+180) / 360) * fromInteger (shift (1::Integer) zoom)
+             let n = 2^zoom
+                 xtile = ((longitude+180) / 360) * n
                  tmp = log (tan (latitude*pi / 180) + secant (latitude * pi / 180))
-                 ytile = ((1-tmp / pi) / 2.0) * fromInteger (shift (1::Integer) zoom)
+                 ytile = ((1-tmp / pi) / 2.0) * n
              in (xtile,ytile)
 
 secant :: Floating a => a -> a
@@ -121,12 +122,12 @@ secant a = 1 / cos a
 selectTilesWithFixedDimensions :: (Coordinate a) => (Int,Int) -> a -> Zoom -> [[TileID]]
 selectTilesWithFixedDimensions (w,h) center z =
   let (x,y) = tileNumbers' (lat center) (lon center) z
-      nrColumns = ceiling $ fromIntegral w / 256
-      nrRows    = ceiling $ fromIntegral h / 256
+      nrColumns, nrRows :: Int
+      nrColumns = 1 + ceiling (fromIntegral w / 256)
+      nrRows    = 1 + ceiling (fromIntegral h / 256)
       -- FIXME hardcoding the tile server tile pixel width
-  in take nrRows $ map (take nrColumns) $ 
-       [ [ TID (truncate xp, truncate yp) | xp <- [x..]] 
-         | yp <- [y..] ] 
+  in [ [ TID (xp, yp) | xp <- [truncate x..truncate x + nrColumns]] 
+         | yp <- [truncate y..truncate y + nrRows] ] 
        -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
 -- |Computes the rectangular map region to download based on GPS points and a zoom level
@@ -160,8 +161,8 @@ selectedTiles :: TileCoords -> [[TileID]]
 selectedTiles c = map (\j -> [TID (i,j) | i <- [minX c..maxX c]]) [minY c .. maxY c]
 
 -- | Formats the URL string
-urlStr :: String -> Int -> Int -> Zoom -> String
-urlStr base xTile yTile zoom = base ++"/"++show zoom++"/"++show xTile++"/"++show yTile++".png"
+urlStr :: String -> TileID -> Zoom -> String
+urlStr base (TID (xTile, yTile)) zoom = base ++"/"++show zoom++"/"++show xTile++"/"++show yTile++".png"
 
 -- | Takes the boundaries of the OSM tiles and downloads the tiles,
 -- keeping them in proper grid patterns for latter stiching or
@@ -178,9 +179,9 @@ downloadTile base zoom t = runResourceT $ do
   liftM (fmap snd) (downloadTile' man base zoom t)
 
 downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status (ResponseHeaders,B.ByteString))
-downloadTile' man base zoom t@(TID (x, y)) = do
+downloadTile' man base zoom t = do
   let packIt = B.concat . L.toChunks
-  url' <- liftBase (parseUrl (urlStr base x y zoom))
+  url' <- liftBase (parseUrl (urlStr base t zoom))
   rsp <- httpLbs url' man
   if statusCode rsp == statusOK
     then return (Right (responseHeaders rsp, packIt (responseBody rsp)))
@@ -286,8 +287,8 @@ instance (MonadIO m) => MonadIO (OSM m) where
 -- Take note - the 'OSMConfig' thread limit is enforced per-evalOSM.
 -- Running many evalOSM processes can result in a violation of the
 -- limit and incur admin wrath.
-evalOSM :: MonadIO m => OSMConfig -> OSM m a -> m a
-evalOSM cfg m = do
+evalOSM :: MonadIO m => OSM m a -> OSMConfig -> m a
+evalOSM m cfg = do
   tc <- liftIO $ newTBChanIO (nrQueuedDownloads cfg)
   acid <- liftIO $ openLocalStateFrom (cache cfg) (TC M.empty)
   liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg acid tc)
@@ -312,7 +313,7 @@ defaultOSMConfig = do
   return $ OSMCfg osmTileURL cache Nothing 1024 2 True
 
 buildUrl :: OSMConfig -> TileID -> Zoom -> String
-buildUrl cfg (TID (x,y)) z = urlStr (baseUrl cfg) x y z
+buildUrl cfg t z = urlStr (baseUrl cfg) t z
 
 -- |Like 'downloadBestFitTiles' but uses the cached copies when available.
 getBestFitTiles :: (Coordinate a, MonadIO m)
