@@ -119,15 +119,17 @@ secant :: Floating a => a -> a
 secant a = 1 / cos a
 
 -- |Given a width, height and center, compute the tiles needed to fill the display
+--
+-- THIS ASSUMES tiles are 256x256 pixels!
 selectTilesWithFixedDimensions :: (Coordinate a) => (Int,Int) -> a -> Zoom -> [[TileID]]
 selectTilesWithFixedDimensions (w,h) center z =
   let (x,y) = tileNumbers' (lat center) (lon center) z
-      nrColumns, nrRows :: Int
-      nrColumns = 1 + ceiling (fromIntegral w / 256)
-      nrRows    = 1 + ceiling (fromIntegral h / 256)
+      nrColumns2, nrRows2 :: Int
+      nrColumns2 = 1 + ceiling (fromIntegral w / 512)
+      nrRows2    = 1 + ceiling (fromIntegral h / 512)
       -- FIXME hardcoding the tile server tile pixel width
-  in [ [ TID (xp, yp) | xp <- [truncate x..truncate x + nrColumns]] 
-         | yp <- [truncate y..truncate y + nrRows] ] 
+  in [ [ TID (xp, yp) | xp <- [truncate x - nrColumns2..truncate x + nrColumns2]] 
+         | yp <- [truncate y - nrRows2..truncate y + nrRows2] ] 
        -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
 -- |Computes the rectangular map region to download based on GPS points and a zoom level
