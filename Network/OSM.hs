@@ -1,6 +1,7 @@
 {-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable,
     FlexibleInstances, MultiParamTypeClasses, OverloadedStrings 
-    , GeneralizedNewtypeDeriving, FlexibleContexts #-}
+    , GeneralizedNewtypeDeriving, FlexibleContexts
+    , QuasiQuotes, GADTs, UndecidableInstances #-}
 module Network.OSM
   (  -- * Basic Types
     TileID(..)
@@ -49,11 +50,15 @@ import Control.Concurrent.STM.TBChan
 import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader (ask)
 import Control.Monad.State
-import Data.Acid
+import Control.Monad.Trans.Control
+import Database.Persist
+import Database.Persist.Sqlite hiding (get)
+import Database.Persist.TH
 import Data.Char (isDigit)
 import Data.Conduit
 import Data.Data
-import Data.SafeCopy
+import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Time
 import Data.Typeable
 import Paths_osm_download
@@ -78,27 +83,9 @@ data TileCoords = TileCoords
 
 -- |A TileID, along with a zoom level, uniquely identifies a single
 -- OSM map tile.  The standard size is 256x256 pixels for such a tile.
-newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Data, Typeable)
+newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Read, Data, Typeable)
 
--- |An on-disk cache of tiles.  Failure to use a local cache results in
--- excessive requests to the tile server.  OSM admins might ban such users.
-newtype TileCache = TC (M.Map (TileID,Zoom) (UTCTime,B.ByteString))
-  deriving (Data, Typeable)
-
-updateTC :: UTCTime -> (TileID,Zoom) -> B.ByteString -> Update TileCache ()
-updateTC expire tid bs = do
-  TC tc <- get
-  let tc' = M.insert tid (expire,bs) tc
-  put (TC tc')
-
-queryTC :: (TileID,Zoom) -> Query TileCache (Maybe (UTCTime,B.ByteString))
-queryTC tid = do
-  TC st <- ask
-  return $ M.lookup tid st
-
-$(deriveSafeCopy 1 'base ''TileID)
-$(deriveSafeCopy 1 'base ''TileCache)
-$(makeAcidic ''TileCache ['updateTC, 'queryTC])
+derivePersistField "TileID"
 
 tileNumbers :: Integral t => Double -> Double -> Zoom -> [(t, t)]
 tileNumbers t g z =
@@ -257,7 +244,7 @@ bestFitCoordinates points =
 -- the retrieve tiles.
 data OSMConfig = OSMCfg
                 { baseUrl      :: String
-                , cache       :: FilePath                  -- ^ Path of the tile cache
+                , cache       :: Text                      -- ^ Path of the tile cache
                 , noCacheAction :: Maybe (TileID -> Zoom -> IO (Either Status B.ByteString))
                                                            -- ^ Action to take if the tile is not cached.
                                                            --   Return 'Just' val for a default value.
@@ -274,27 +261,43 @@ data OSMConfig = OSMCfg
 -- local caching), the state of the local cache, and initial
 -- configuration options.
 data OSMState = OSMSt 
-                { acid        :: AcidState TileCache
-                , neededTiles :: TBChan (TileID,Zoom)
+                { neededTiles :: TBChan (TileID,Zoom)
+                , dbPool      :: ConnectionPool
                 , cfg         :: OSMConfig }
 
 -- |A Monad transformer allowing you acquire OSM maps
 newtype OSM m a = OSM { runOSM :: StateT OSMState m a }
-         deriving (Monad, MonadTrans, MonadState OSMState)
+         deriving (Monad, MonadState OSMState)
+
+share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persist|
+TileEntry
+    tileID TileID
+    zoom   Zoom
+    tileExipation UTCTime
+    tileData B.ByteString
+    TileCacheID tileID zoom
+|]
+
+instance MonadTrans OSM where
+  lift = OSM . lift
 
 instance (MonadIO m) => MonadIO (OSM m) where
   liftIO = lift . liftIO
+
+runDB :: (MonadIO m, MonadBaseControl IO m) => SqlPersist m a -> OSM m a
+runDB f = gets dbPool >>= lift . runSqlPool f
 
 -- |evalOSM allows you to query an OSM server and the local cache.
 -- Take note - the 'OSMConfig' thread limit is enforced per-evalOSM.
 -- Running many evalOSM processes can result in a violation of the
 -- limit and incur admin wrath.
-evalOSM :: MonadIO m => OSM m a -> OSMConfig -> m a
-evalOSM m cfg = do
+evalOSM :: (MonadBaseControl IO m, MonadIO m, ResourceIO m) => OSM m a -> OSMConfig -> m a
+evalOSM m cfg = withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
+  $ \conn -> do
+  runSqlPool (runMigration migrateAll) conn
   tc <- liftIO $ newTBChanIO (nrQueuedDownloads cfg)
-  acid <- liftIO $ openLocalStateFrom (cache cfg) (TC M.empty)
-  liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg acid tc)
-  let s = OSMSt acid tc cfg
+  liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg tc conn)
+  let s = OSMSt tc conn cfg
   evalStateT (runOSM m) s
 
 -- Pulls requested tiles off the queue, downloads them, and adds them
@@ -302,35 +305,38 @@ evalOSM m cfg = do
 -- hasn't already inserted it while the item was queued.  We leave the
 -- possibility that it is being downloaded in parallel by another
 -- 'monitorTileQueue' as acceptable duplication of work.
-monitorTileQueue :: OSMConfig -> AcidState TileCache -> TBChan (TileID, Zoom) -> IO ()
-monitorTileQueue cfg acid tc = forever $ do
+monitorTileQueue :: OSMConfig -> TBChan (TileID, Zoom) -> ConnectionPool -> IO ()
+monitorTileQueue cfg tc p = forever go
+ where
+ go :: IO ()
+ go = do
   (t,z) <- atomically $ readTBChan tc
-  b <- liftIO $ query acid (QueryTC (t,z))
+  b     <- runSqlPool (getBy (TileCacheID t z)) p
   case b of
     Nothing -> doDownload t z
-    Just (exp,_) -> do
-      now <- getCurrentTime
+    Just (Entity _ (TileEntry _ _ exp _)) -> do
+      now <- liftIO getCurrentTime
       when (exp < now) (doDownload t z)
- where  
-   doDownload t z = do
+ doDownload :: TileID -> Zoom -> IO ()
+ doDownload t z = do
      let addr = buildUrl cfg t z
      tileE <- downloadTileAndExprTime addr z t
      case tileE of
        Left err -> return ()
-       Right (exp,bs)  -> update acid (UpdateTC exp (t,z) bs) >> createCheckpoint acid
+       Right (exp,bs)  -> runSqlPool (insertBy (TileEntry t z exp bs) >> return ()) p
 
 -- |A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
 defaultOSMConfig :: IO OSMConfig
 defaultOSMConfig = do
   cache <- getDataFileName "TileCache"
-  return $ OSMCfg osmTileURL cache Nothing 1024 2 True
+  return $ OSMCfg osmTileURL (T.pack cache) Nothing 64 2 True
 
 buildUrl :: OSMConfig -> TileID -> Zoom -> String
 buildUrl cfg t z = urlStr (baseUrl cfg) t z
 
 -- |Like 'downloadBestFitTiles' but uses the cached copies when available.
-getBestFitTiles :: (Coordinate a, MonadIO m)
+getBestFitTiles :: (Coordinate a, MonadIO m, MonadBaseControl IO m, ResourceIO m)
                      => [a] -> OSM m [[Either Status B.ByteString]]
 getBestFitTiles cs = do
   let (coords,zoom) = bestFitCoordinates cs
@@ -338,7 +344,7 @@ getBestFitTiles cs = do
   getTiles tids zoom
 
 -- |Like 'downloadTiles' but uses the cached copies when available
-getTiles :: (MonadIO m)
+getTiles :: (MonadIO m, MonadBaseControl IO m, ResourceIO m)
             => [[TileID]] 
             -> Zoom 
             -> OSM m [[Either Status B.ByteString]]
@@ -363,38 +369,35 @@ downloadTileAndExprTime base z t = do
 -- 
 -- When the cached copy is out of date it will still be returned but a
 -- new copy will be downloaded and added to the cache concurrently.
-getTile :: (MonadIO m) => TileID -> Zoom -> OSM m (Either Status B.ByteString)
+getTile :: (ResourceIO m, MonadBaseControl IO m, MonadIO m) => TileID -> Zoom -> OSM m (Either Status B.ByteString)
 getTile t zoom = do
-  st  <- gets acid
   ch  <- gets neededTiles
+  p   <- gets dbPool
   nca <- gets (noCacheAction . cfg)
-  b <- liftIO $ query st (QueryTC (t,zoom))
+  b   <- runDB $ getBy (TileCacheID t zoom)
   case b of
     Nothing -> do
       case nca of
         Nothing  -> blockingTileDownloadUpdateCache
-        Just act -> liftIO $ do
-          atomically $ writeTBChan ch (t,zoom)
-          act t zoom
-    Just (expTime,x)  -> do
-      liftIO $ do
-         now <- getCurrentTime
-         let exp = expTime < now
-         when exp (atomically (tryWriteTBChan ch (t,zoom)) >> return ())
+        Just act -> do
+          liftIO $ atomically $ tryWriteTBChan ch (t,zoom)
+          liftIO $ act t zoom
+    Just (Entity _ (TileEntry _ _ expTime x))  -> do
+      now <- liftIO getCurrentTime
+      let exp = expTime < now
+      when exp (liftIO $ atomically (tryWriteTBChan ch (t,zoom)) >> return ())
       return (Right x)
   where
     blockingTileDownloadUpdateCache = do
-      st  <- gets acid
-      net <- gets (networkEnabled . cfg)
+      net  <- gets (networkEnabled . cfg)
       base <- gets (baseUrl . cfg)
-      if net 
+      p    <- gets dbPool
+      if net
        then do
         res <- liftIO $ downloadTileAndExprTime base zoom t
         case res of
            Right (delTime,bs) -> do
-             liftIO $ do
-               update st (UpdateTC delTime (t,zoom) bs)
-               createCheckpoint st
+             runDB (insertBy (TileEntry t zoom delTime bs) >> return ())
              return (Right bs)
            Left err -> return (Left err)
        else return (Left statusServiceUnavailable)
