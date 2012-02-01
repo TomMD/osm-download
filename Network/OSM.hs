@@ -22,13 +22,17 @@ module Network.OSM
   , downloadTiles
   , downloadTile
   , osmTileURL
+  -- * Frame-oriented operations
+  , Frame(..)
+  , selectTilesForFrame
+  , tileCoordsForFrame
+  , pixelPositionForFrame
   -- * Helper Functions
   , pixelPosForCoord
-  , selectTilesWithFixedDimensions
   , determineTileCoords
   , selectedTiles
   -- * Legal
-  , copyrightText
+  , osmCopyrightText
   )where
 
 import Control.Monad
@@ -87,11 +91,11 @@ newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Read, Data
 
 derivePersistField "TileID"
 
-tileNumbers :: Integral t => Double -> Double -> Zoom -> [(t, t)]
-tileNumbers t g z =
-  let (a,b) = tileNumbers' t g z
-      bounds x = [ceiling x, floor x]
-  in [(xt,yt) | xt <- bounds a, yt <- bounds b]
+tileNumber :: (Coordinate a) => a -> Zoom -> (Double, Double)
+tileNumber a z =
+  let t = lat a 
+      g = lon a
+  in tileNumbers' t g z
 
 -- |OSM defined method of converting a coordinate and zoom level to a tile
 tileNumbers' :: Double -> Double -> Zoom -> (Double,Double)
@@ -101,15 +105,25 @@ tileNumbers' latitude longitude zoom =
                  tmp = log (tan (latitude*pi / 180) + secant (latitude * pi / 180))
                  ytile = ((1-tmp / pi) / 2.0) * n
              in (xtile,ytile)
+ where
+  secant :: Floating a => a -> a
+  secant a = 1 / cos a
 
-secant :: Floating a => a -> a
-secant a = 1 / cos a
+-- A frame is a point of view including the number of pixels
+-- (width,height), center, and zoom.  All pixel positions with respect
+-- to a frame are from the lower left corner of the lower left tile of
+-- the grid that displays the frame.
+data Frame a = Frame { width,height :: Int
+                     , center       :: a
+                     , frameZoom    :: Zoom
+                     } deriving (Eq, Ord, Show, Read)
 
--- |Given a width, height and center, compute the tiles needed to fill the display
+-- |Given a width, height and center, compute the tiles needed to fill
+-- the display.
 --
 -- THIS ASSUMES tiles are 256x256 pixels!
-selectTilesWithFixedDimensions :: (Coordinate a) => (Int,Int) -> a -> Zoom -> [[TileID]]
-selectTilesWithFixedDimensions (w,h) center z =
+selectTilesForFrame :: (Coordinate a) => Frame a -> [[TileID]]
+selectTilesForFrame (Frame w h center z) =
   let (x,y) = tileNumbers' (lat center) (lon center) z
       nrColumns2, nrRows2 :: Int
       nrColumns2 = 1 + ceiling (fromIntegral w / 512)
@@ -119,20 +133,45 @@ selectTilesWithFixedDimensions (w,h) center z =
          | yp <- [truncate y - nrRows2..truncate y + nrRows2] ] 
        -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
+tileCoordsForFrame :: (Coordinate a) => Frame a -> TileCoords
+tileCoordsForFrame frm =
+  let (xs,ys) = unzip . map unTID . concat . selectTilesForFrame $ frm
+  in TileCoords
+     { maxX = maximum xs
+     , minX = minimum xs
+     , maxY = maximum ys
+     , minY = minimum ys
+     }
+
+-- Gives the position of the coordinate in the frame with the origin as
+-- the lower left (note this is different from the lower level operations!)
+pixelPositionForFrame :: (Coordinate a) => Frame a -> a -> (Int,Int)
+pixelPositionForFrame frm q =
+  let coords = tileCoordsForFrame frm
+      (x,y') = pixelPosForCoord q coords (frameZoom frm)
+  in (x + 128, y' + 128)
+     -- FIXME ^^^ I'm not sure why it's off by half a tile in each dimension
+
 -- |Computes the rectangular map region to download based on GPS points and a zoom level
 determineTileCoords :: (Coordinate a) => [a] -> Zoom -> Maybe TileCoords
 determineTileCoords [] _ = Nothing
 determineTileCoords wpts z =
-    let (xs,ys) = unzip $ concatMap (\w -> tileNumbers (lat w) (lon w) z) wpts
+    let (xs,ys) = unzip $ map (flip tileNumber z) wpts
+        xs' = map truncate xs
+        ys' = map truncate ys
     in Just $ TileCoords
-         { maxX = maximum xs
-         , minX = minimum xs
-         , maxY = maximum ys
-         , minY = minimum ys
+         { maxX = maximum xs'
+         , minX = minimum xs'
+         , maxY = maximum ys'
+         , minY = minimum ys'
          }
 
 maxNumAutoTiles = 32
 
+-- Computes a reasonable zoom level for the given tile coordinates
+-- Resulting zoom levles are always <= 16!
+--
+-- Basically, zooms out until there will be less than 'maxNumAutoTiles' tiles.
 zoomCalc :: TileCoords -> Zoom
 zoomCalc tCoords = 
    let numxtiles = maxX tCoords - minX tCoords + 1
@@ -181,7 +220,7 @@ projectMercToLat rely = (180 / pi) * atan (sinh rely)
 
 -- | Used by @pixelPosForCoord@ for N,S,E,W coordinates for (x,y) values
 project :: Double -> Double -> Zoom -> (Double,Double,Double,Double)
-project x y zoom = 
+project x y zoom =
   let unit = 1.0 / (2.0 ** fromIntegral zoom)
       rely1 = y * unit
       rely2 = rely1 + unit
@@ -196,23 +235,24 @@ project x y zoom =
   in (lat2,long1,lat1,long1+unit') -- S,W,N,E
   
 -- | Takes a coordinate, the OSM tile boundaries, and a zoom level then
--- generates (x,y) points to be placed on the Image.
+-- generates (x,y) points to be placed on the Image. The origin is
+-- in the upper left of the picture.
 pixelPosForCoord :: (Coordinate a, Integral t) => a -> TileCoords -> Zoom -> (t, t)
 pixelPosForCoord wpt tCoord zoom =
-             let lat' = lat wpt
-                 lon' = lon wpt
-                 tile = tileNumbers' lat' lon' zoom
-                 xoffset = (fst tile - fromIntegral (minX tCoord)) * 256
-                 yoffset = (snd tile - fromIntegral (minY tCoord)) * 256
-                 (south,west,north,east) = (uncurry project tile zoom)
-                 x = round $ (lon' - west) * 256.0 / (east - west) + xoffset
-                 y = round $ (lat' - north) * 256.0 / (south - north) + yoffset
-             in (x,y)
+  let lat' = lat wpt
+      lon' = lon wpt
+      tile@(tx,ty) = tileNumbers' lat' lon' zoom
+      xoffset = (tx - fromIntegral (minX tCoord)) * 256
+      yoffset = (ty - fromIntegral (minY tCoord)) * 256
+      (south,west,north,east) = (uncurry project tile zoom)
+      x = truncate $ (lon' - west) * 256.0  / (east - west)   + xoffset
+      y = truncate $ (lat' - north) * 256.0 / (south - north) + yoffset
+  in (x,y)
 
 -- | The suggested copyright text in accordance with
 -- <http://wiki.openstreetmap.org/wiki/Legal_FAQ>
-copyrightText :: String
-copyrightText = "Tile images © OpenStreetMap (and) contributors, CC-BY-SA"
+osmCopyrightText :: String
+osmCopyrightText = "Tile images © OpenStreetMap (and) contributors, CC-BY-SA"
 
 -- | Takes the tile server base URL,
 -- the set of coordinates that must appear within the map boundaries, and users
