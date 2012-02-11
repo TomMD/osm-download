@@ -67,6 +67,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time
 import Data.Typeable
+import System.Directory
 import Paths_osm_download
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map as M
@@ -380,6 +381,7 @@ monitorTileQueue cfg tc p = forever (X.catch go hdl)
 -- and a cabal-generated directory for the cache directory
 defaultOSMConfig :: IO OSMConfig
 defaultOSMConfig = do
+  getDataDir >>= createDirectoryIfMissing True
   cache <- getDataFileName "TileCache"
   return $ OSMCfg osmTileURL (T.pack cache) Nothing 64 2 True
 

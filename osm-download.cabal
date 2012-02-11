@@ -36,6 +36,7 @@ Library
                      , text >= 0.11 && < 0.12
                      , monad-control >= 0.3 && < 0.4
                      , data-default >= 0.3 && < 0.4
+                     , directory >= 1.1 && < 1.2
   Other-modules:      Paths_osm_download 
   -- Extra tools (e.g. alex, hsc2hs, ...) needed to build the source.
   -- Build-tools:         
