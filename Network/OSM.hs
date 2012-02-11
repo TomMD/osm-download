@@ -1,5 +1,5 @@
 {-# LANGUAGE TemplateHaskell, TypeFamilies, DeriveDataTypeable,
-    FlexibleInstances, MultiParamTypeClasses, OverloadedStrings 
+    FlexibleInstances, MultiParamTypeClasses, OverloadedStrings
     , GeneralizedNewtypeDeriving, FlexibleContexts
     , QuasiQuotes, GADTs, UndecidableInstances #-}
 module Network.OSM
@@ -46,6 +46,7 @@ import Data.Word
 import Network.HTTP.Conduit
 import Network.HTTP.Types ( Status, statusOK, ResponseHeaders
                           , parseSimpleQuery, statusServiceUnavailable)
+import Data.Default
 
 -- For the cacheing
 import Control.Concurrent.MonadIO (forkIO)
@@ -58,6 +59,7 @@ import Control.Monad.Trans.Control
 import Database.Persist
 import Database.Persist.Sqlite hiding (get)
 import Database.Persist.TH
+import Database.Sqlite (Error)
 import Data.Char (isDigit)
 import Data.Conduit
 import Data.Data
@@ -68,7 +70,9 @@ import Data.Typeable
 import Paths_osm_download
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map as M
+import qualified Control.Exception as X
 
+-- FIXME zoom should be a newtype with Num instance that saturates (doesn't over/under flow)
 type Zoom = Int
 
 -- | The official OSM tile server.
@@ -80,9 +84,9 @@ osmTileURL = "http://tile.openstreetmap.org"
 -- using 'selectedTiles' before final download with 'downloadTiles'.
 data TileCoords = TileCoords
                      { minX :: Int
-                     , maxX :: Int  
-                     , minY :: Int  
-                     , maxY :: Int 
+                     , maxX :: Int
+                     , minY :: Int
+                     , maxY :: Int
                      } deriving (Eq, Ord, Show)
 
 -- |A TileID, along with a zoom level, uniquely identifies a single
@@ -93,13 +97,13 @@ derivePersistField "TileID"
 
 tileNumber :: (Coordinate a) => a -> Zoom -> (Double, Double)
 tileNumber a z =
-  let t = lat a 
+  let t = lat a
       g = lon a
   in tileNumbers' t g z
 
 -- |OSM defined method of converting a coordinate and zoom level to a tile
 tileNumbers' :: Double -> Double -> Zoom -> (Double,Double)
-tileNumbers' latitude longitude zoom = 
+tileNumbers' latitude longitude zoom =
              let n = 2^zoom
                  xtile = ((longitude+180) / 360) * n
                  tmp = log (tan (latitude*pi / 180) + secant (latitude * pi / 180))
@@ -129,8 +133,8 @@ selectTilesForFrame (Frame w h center z) =
       nrColumns2 = 1 + ceiling (fromIntegral w / 512)
       nrRows2    = 1 + ceiling (fromIntegral h / 512)
       -- FIXME hardcoding the tile server tile pixel width
-  in [ [ TID (xp, yp) | xp <- [truncate x - nrColumns2..truncate x + nrColumns2]] 
-         | yp <- [truncate y - nrRows2..truncate y + nrRows2] ] 
+  in [ [ TID (xp, yp) | xp <- [truncate x - nrColumns2..truncate x + nrColumns2]]
+         | yp <- [truncate y - nrRows2..truncate y + nrRows2] ]
        -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
 tileCoordsForFrame :: (Coordinate a) => Frame a -> TileCoords
@@ -173,7 +177,7 @@ maxNumAutoTiles = 32
 --
 -- Basically, zooms out until there will be less than 'maxNumAutoTiles' tiles.
 zoomCalc :: TileCoords -> Zoom
-zoomCalc tCoords = 
+zoomCalc tCoords =
    let numxtiles = maxX tCoords - minX tCoords + 1
        numytiles = maxY tCoords - minY tCoords + 1
        div = getZoomDiv numxtiles numytiles 0
@@ -197,13 +201,13 @@ urlStr base (TID (xTile, yTile)) zoom = base ++"/"++show zoom++"/"++show xTile++
 -- side-by-side display.
 downloadTiles :: String -> Zoom -> [[TileID]] -> IO [[Either Status B.ByteString]]
 downloadTiles base zoom ts = runResourceT $ do
-  man <- newManager
+  man <- liftIO $ newManager def
   mapM (mapM (liftM (fmap snd) . downloadTile' man base zoom)) ts
-  
+
 -- |Download a single tile form a given OSM server URL.
 downloadTile :: String -> Zoom -> TileID -> IO (Either Status B.ByteString)
 downloadTile base zoom t = runResourceT $ do
-  man <- newManager
+  man <- liftIO $ newManager def
   liftM (fmap snd) (downloadTile' man base zoom t)
 
 downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status (ResponseHeaders,B.ByteString))
@@ -233,7 +237,7 @@ project x y zoom =
       unit' = 360.0 / (2.0 ** fromIntegral zoom)
       long1 = (-180.0) + x * unit'
   in (lat2,long1,lat1,long1+unit') -- S,W,N,E
-  
+
 -- | Takes a coordinate, the OSM tile boundaries, and a zoom level then
 -- generates (x,y) points to be placed on the Image. The origin is
 -- in the upper left of the picture.
@@ -268,10 +272,10 @@ downloadBestFitTiles base points = do
   downloadTiles base zoom tids
 
 bestFitCoordinates :: (Coordinate a) => [a] -> (TileCoords, Zoom)
-bestFitCoordinates points = 
+bestFitCoordinates points =
   let tiles = determineTileCoords points 16
       zoom = fmap zoomCalc tiles
-      tiles' = join 
+      tiles' = join
              . fmap (determineTileCoords points)
              $ zoom
   in case (tiles',zoom) of
@@ -300,38 +304,43 @@ data OSMConfig = OSMCfg
 -- |The OSM operations maintain a list of tiles needing refreshed (for
 -- local caching), the state of the local cache, and initial
 -- configuration options.
-data OSMState = OSMSt 
+data OSMState = OSMSt
                 { neededTiles :: TBChan (TileID,Zoom)
                 , dbPool      :: ConnectionPool
                 , cfg         :: OSMConfig }
 
 -- |A Monad transformer allowing you acquire OSM maps
-newtype OSM m a = OSM { runOSM :: StateT OSMState m a }
+newtype OSM a = OSM { runOSM :: StateT OSMState IO a }
          deriving (Monad, MonadState OSMState)
 
 share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persist|
 TileEntry
     tileID TileID
     zoom   Zoom
-    tileExipation UTCTime
+    tileExpiration UTCTime
     tileData B.ByteString
     TileCacheID tileID zoom
 |]
 
-instance MonadTrans OSM where
-  lift = OSM . lift
+instance MonadIO OSM where
+  liftIO = OSM . liftIO
 
-instance (MonadIO m) => MonadIO (OSM m) where
-  liftIO = lift . liftIO
-
-runDB :: (MonadIO m, MonadBaseControl IO m) => SqlPersist m a -> OSM m a
-runDB f = gets dbPool >>= lift . runSqlPool f
+runDB :: SqlPersist IO a -> OSM a
+runDB f = do
+  p <- gets dbPool
+  v <- liftIO (X.catch (liftM Right $ runSqlPool f p) hdl)
+  case v of
+   Left e -> runDB f
+   Right x -> return x
+ where
+  -- hdl :: Error -> IO (Either Error a)
+  hdl = return . Left . (id :: X.SomeException -> X.SomeException)
 
 -- |evalOSM allows you to query an OSM server and the local cache.
 -- Take note - the 'OSMConfig' thread limit is enforced per-evalOSM.
 -- Running many evalOSM processes can result in a violation of the
 -- limit and incur admin wrath.
-evalOSM :: (MonadBaseControl IO m, MonadIO m, ResourceIO m) => OSM m a -> OSMConfig -> m a
+evalOSM :: OSM a -> OSMConfig -> IO a
 evalOSM m cfg = withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
   $ \conn -> do
   runSqlPool (runMigration migrateAll) conn
@@ -346,8 +355,10 @@ evalOSM m cfg = withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
 -- possibility that it is being downloaded in parallel by another
 -- 'monitorTileQueue' as acceptable duplication of work.
 monitorTileQueue :: OSMConfig -> TBChan (TileID, Zoom) -> ConnectionPool -> IO ()
-monitorTileQueue cfg tc p = forever go
+monitorTileQueue cfg tc p = forever (X.catch go hdl)
  where
+ hdl :: X.SomeException {- Error -} -> IO ()
+ hdl err = return () -- Silently ignore SQL errors (usually ErrorBusy)
  go :: IO ()
  go = do
   (t,z) <- atomically $ readTBChan tc
@@ -376,26 +387,25 @@ buildUrl :: OSMConfig -> TileID -> Zoom -> String
 buildUrl cfg t z = urlStr (baseUrl cfg) t z
 
 -- |Like 'downloadBestFitTiles' but uses the cached copies when available.
-getBestFitTiles :: (Coordinate a, MonadIO m, MonadBaseControl IO m, ResourceIO m)
-                     => [a] -> OSM m [[Either Status B.ByteString]]
+getBestFitTiles :: (Coordinate a)
+                     => [a] -> OSM [[Either Status B.ByteString]]
 getBestFitTiles cs = do
   let (coords,zoom) = bestFitCoordinates cs
       tids = selectedTiles coords
   getTiles tids zoom
 
 -- |Like 'downloadTiles' but uses the cached copies when available
-getTiles :: (MonadIO m, MonadBaseControl IO m, ResourceIO m)
-            => [[TileID]] 
-            -> Zoom 
-            -> OSM m [[Either Status B.ByteString]]
+getTiles :: [[TileID]]
+         -> Zoom
+         -> OSM [[Either Status B.ByteString]]
 getTiles ts z = mapM (mapM (\t -> getTile t z)) ts
 
-downloadTileAndExprTime ::    String 
-                           -> Zoom 
-                           -> TileID 
+downloadTileAndExprTime ::    String
+                           -> Zoom
+                           -> TileID
                            -> IO (Either Status (UTCTime,B.ByteString))
 downloadTileAndExprTime base z t = do
-  res <- runResourceT $ newManager >>= \m -> downloadTile' m base z t
+  res <- runResourceT $ liftIO (newManager def) >>= \m -> downloadTile' m base z t
   case res of
     Right (hdrs,bs) -> do
       now <- getCurrentTime
@@ -406,10 +416,10 @@ downloadTileAndExprTime base z t = do
 
 -- |Like 'downloadTile' but uses a cached copy when available.
 -- Downloaded copies are added to the cache.
--- 
+--
 -- When the cached copy is out of date it will still be returned but a
 -- new copy will be downloaded and added to the cache concurrently.
-getTile :: (ResourceIO m, MonadBaseControl IO m, MonadIO m) => TileID -> Zoom -> OSM m (Either Status B.ByteString)
+getTile :: TileID -> Zoom -> OSM (Either Status B.ByteString)
 getTile t zoom = do
   ch  <- gets neededTiles
   p   <- gets dbPool
