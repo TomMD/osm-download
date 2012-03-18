@@ -1,5 +1,5 @@
 Name:                osm-download
-Version:             0.3.2
+Version:             0.3.3
 Synopsis:            Download Open Street Map tiles
 Description:         Download and locally cache open street map tiles based on HTTP
                      cache control headers.
@@ -29,7 +29,7 @@ Library
                      , mtl >= 2.0 && < 2.1
                      , transformers-base >= 0.4 && < 0.5
                      , transformers >= 0.2 && < 0.3
-                     , time >= 1.2 && < 1.4
+                     , time >= 1.2 && < 1.5
                      , stm >= 2.2 && < 2.4 
                      , monadIO >= 0.10 && < 0.11
                      , stm-chans >= 1.2 && < 1.4
