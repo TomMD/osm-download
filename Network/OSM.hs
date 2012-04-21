@@ -44,8 +44,8 @@ import Data.GPS
 import Data.Maybe
 import Data.Word
 import Network.HTTP.Conduit
-import Network.HTTP.Types ( Status, statusOK, ResponseHeaders
-                          , parseSimpleQuery, statusServiceUnavailable)
+import Network.HTTP.Types ( Status, ok200, ResponseHeaders
+                          , parseSimpleQuery, serviceUnavailable503)
 import Data.Default
 
 -- For the cacheing
@@ -216,9 +216,9 @@ downloadTile' man base zoom t = do
   let packIt = B.concat . L.toChunks
   url' <- liftBase (parseUrl (urlStr base t zoom))
   rsp <- httpLbs url' man
-  if statusCode rsp == statusOK
+  if  (responseStatus rsp) == ok200
     then return (Right (responseHeaders rsp, packIt (responseBody rsp)))
-    else return (Left $ statusCode rsp)
+    else return (Left $ responseStatus rsp)
 
 projectMercToLat :: Floating a => a -> a
 projectMercToLat rely = (180 / pi) * atan (sinh rely)
@@ -452,7 +452,7 @@ getTile t zoom = do
              runDB (insertBy (TileEntry t zoom delTime bs) >> return ())
              return (Right bs)
            Left err -> return (Left err)
-       else return (Left statusServiceUnavailable)
+       else return (Left serviceUnavailable503)
 
 -- | Determine the lenth of time to cache an HTTP response (in seconds)
 cacheLength :: ResponseHeaders -> Int
