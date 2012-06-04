@@ -40,7 +40,7 @@ import Control.Monad.Base (liftBase)
 import Data.Bits
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
-import Data.GPS
+import Geo.Computations
 import Data.Maybe
 import Data.Word
 import Network.HTTP.Conduit
@@ -96,10 +96,10 @@ newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Read, Data
 
 derivePersistField "TileID"
 
-tileNumber :: (Coordinate a) => a -> Zoom -> (Double, Double)
+tileNumber :: Point -> Zoom -> (Double, Double)
 tileNumber a z =
-  let t = lat a
-      g = lon a
+  let t = pntLat a
+      g = pntLon a
   in tileNumbers' t g z
 
 -- |OSM defined method of converting a coordinate and zoom level to a tile
@@ -127,9 +127,9 @@ data Frame a = Frame { width,height :: Int
 -- the display.
 --
 -- THIS ASSUMES tiles are 256x256 pixels!
-selectTilesForFrame :: (Coordinate a) => Frame a -> [[TileID]]
+selectTilesForFrame :: Frame Point -> [[TileID]]
 selectTilesForFrame (Frame w h center z) =
-  let (x,y) = tileNumbers' (lat center) (lon center) z
+  let (x,y) = tileNumbers' (pntLat center) (pntLon center) z
       nrColumns2, nrRows2 :: Int
       nrColumns2 = 1 + ceiling (fromIntegral w / 512)
       nrRows2    = 1 + ceiling (fromIntegral h / 512)
@@ -138,7 +138,7 @@ selectTilesForFrame (Frame w h center z) =
          | yp <- [truncate y - nrRows2..truncate y + nrRows2] ]
        -- FIXME not handling boundary conditions, such as +/-180 longitude!
 
-tileCoordsForFrame :: (Coordinate a) => Frame a -> TileCoords
+tileCoordsForFrame :: Frame Point -> TileCoords
 tileCoordsForFrame frm =
   let (xs,ys) = unzip . map unTID . concat . selectTilesForFrame $ frm
   in TileCoords
@@ -150,7 +150,7 @@ tileCoordsForFrame frm =
 
 -- Gives the position of the coordinate in the frame with the origin as
 -- the lower left (note this is different from the lower level operations!)
-pixelPositionForFrame :: (Coordinate a) => Frame a -> a -> (Int,Int)
+pixelPositionForFrame :: Frame Point -> Point -> (Int,Int)
 pixelPositionForFrame frm q =
   let coords = tileCoordsForFrame frm
       (x,y') = pixelPosForCoord q coords (frameZoom frm)
@@ -158,7 +158,7 @@ pixelPositionForFrame frm q =
      -- FIXME ^^^ I'm not sure why it's off by half a tile in each dimension
 
 -- |Computes the rectangular map region to download based on GPS points and a zoom level
-determineTileCoords :: (Coordinate a) => [a] -> Zoom -> Maybe TileCoords
+determineTileCoords :: [Point] -> Zoom -> Maybe TileCoords
 determineTileCoords [] _ = Nothing
 determineTileCoords wpts z =
     let (xs,ys) = unzip $ map (flip tileNumber z) wpts
@@ -242,10 +242,10 @@ project x y zoom =
 -- | Takes a coordinate, the OSM tile boundaries, and a zoom level then
 -- generates (x,y) points to be placed on the Image. The origin is
 -- in the upper left of the picture.
-pixelPosForCoord :: (Coordinate a, Integral t) => a -> TileCoords -> Zoom -> (t, t)
+pixelPosForCoord :: Integral t => Point -> TileCoords -> Zoom -> (t, t)
 pixelPosForCoord wpt tCoord zoom =
-  let lat' = lat wpt
-      lon' = lon wpt
+  let lat' = pntLat wpt
+      lon' = pntLon wpt
       tile@(tx,ty) = tileNumbers' lat' lon' zoom
       xoffset = (tx - fromIntegral (minX tCoord)) * 256
       yoffset = (ty - fromIntegral (minY tCoord)) * 256
@@ -266,13 +266,13 @@ osmCopyrightText = "Tile images © OpenStreetMap (and) contributors, CC-BY-SA"
 -- The returned files should all be in an approriate grid for row/column display.
 -- See the test files of Main.hs and Main2.hs for examples of Repa stiching tiles
 -- into a single image or side by side display of individual tiles.
-downloadBestFitTiles :: (Coordinate a) => String -> [a] -> IO [[Either Status B.ByteString]]
+downloadBestFitTiles :: String -> [Point] -> IO [[Either Status B.ByteString]]
 downloadBestFitTiles base points = do
   let (coords,zoom) = bestFitCoordinates points
       tids = selectedTiles coords
   downloadTiles base zoom tids
 
-bestFitCoordinates :: (Coordinate a) => [a] -> (TileCoords, Zoom)
+bestFitCoordinates :: [Point] -> (TileCoords, Zoom)
 bestFitCoordinates points =
   let tiles = determineTileCoords points 16
       zoom = fmap zoomCalc tiles
@@ -389,8 +389,7 @@ buildUrl :: OSMConfig -> TileID -> Zoom -> String
 buildUrl cfg t z = urlStr (baseUrl cfg) t z
 
 -- |Like 'downloadBestFitTiles' but uses the cached copies when available.
-getBestFitTiles :: (Coordinate a)
-                     => [a] -> OSM [[Either Status B.ByteString]]
+getBestFitTiles :: [Point] -> OSM [[Either Status B.ByteString]]
 getBestFitTiles cs = do
   let (coords,zoom) = bestFitCoordinates cs
       tids = selectedTiles coords
