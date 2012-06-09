@@ -214,7 +214,8 @@ downloadTile base zoom t = runResourceT $ do
 downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status (ResponseHeaders,B.ByteString))
 downloadTile' man base zoom t = do
   let packIt = B.concat . L.toChunks
-  url' <- liftBase (parseUrl (urlStr base t zoom))
+      url = urlStr base t zoom
+  url' <- liftBase (parseUrl url)
   rsp <- httpLbs url' man
   if  (responseStatus rsp) == ok200
     then return (Right (responseHeaders rsp, packIt (responseBody rsp)))
@@ -371,8 +372,7 @@ monitorTileQueue cfg tc p = forever (X.catch go hdl)
       when (exp < now) (doDownload t z)
  doDownload :: TileID -> Zoom -> IO ()
  doDownload t z = do
-     let addr = buildUrl cfg t z
-     tileE <- downloadTileAndExprTime addr z t
+     tileE <- downloadTileAndExprTime (baseUrl cfg) z t
      case tileE of
        Left err -> return ()
        Right (exp,bs)  -> runSqlPool (insertBy (TileEntry t z exp bs) >> return ()) p

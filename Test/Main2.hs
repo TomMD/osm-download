@@ -1,18 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
-import Graphics.Gloss
-import Graphics.Gloss.DevIL
-import System.IO.Temp
 import System.Environment
 import qualified Data.ByteString as B
 import Network.OSM
-import Data.GPS
-
-import System.IO
-import Data.Array.Repa.IO.DevIL
-import qualified Data.Array.Repa as R
-import Data.Array.Repa (Array, DIM3, Z(..), (:.)(..), extent, reshape)
-import Data.Word
-import qualified Data.List
+import Geo.GPX.Conduit
 
 main = do
   args    <- getArgs
@@ -20,13 +10,15 @@ main = do
     [latS,lonS] -> 
       let lat = realToFrac (read latS :: Double)
           lon = realToFrac (read lonS :: Double)
-      in run [ptType lat lon Nothing Nothing]
+      in run [pt lat lon Nothing Nothing]
     _ -> putStr
            $  unlines [ "usage: bitmap <file.png>"
                       , "  file.png should be a PNG file (32-bit RGBA)"]
 
 run pts
- = do files <- downloadBestFitTiles osmTileURL pts
+ = do files <- (map (either (error . show) id) . concat) `fmap` downloadBestFitTiles osmTileURL pts
+      mapM_ (\(f,c) -> B.writeFile f c) (zip (map (\n -> "test" ++ show n ++ ".png") [1..]) files)
+{-
       arrs <- mapM (mapM stupidConversion) files
       let pics = map (map (repaToPicture True)) arrs
           (x,y) = ...  pics
@@ -55,3 +47,4 @@ stupidConversion bs = do
   hClose hdl
   !pic <- readRepaImage (path ++ "/blah")
   return pic
+-}
