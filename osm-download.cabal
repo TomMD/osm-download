@@ -16,28 +16,29 @@ Cabal-version:       >=1.6
 Library
   Exposed-modules:     Network.OSM
   Build-depends:       base >= 4 && < 5
-                     , conduit >= 0.5 && < 0.6
-                     , pool-conduit >= 0.1 && < 0.2
-                     , http-conduit >= 1.2 && < 1.6
-                     , http-types >= 0.6 && < 0.8
-                     , bytestring >= 0.8 && < 1.0
-                     , gps >= 1.1 && < 1.2
-                     , containers >= 0.3 && < 0.6
-                     , persistent-sqlite >= 1.0 && < 1.1
-                     , persistent-template >= 1.0 && < 1.1
-                     , persistent >= 1.0 && < 1.1
-                     , mtl >= 2.0 && < 2.2
-                     , transformers-base >= 0.4 && < 0.5
-                     , transformers >= 0.2 && < 0.4
-                     , time >= 1.2 && < 1.5
-                     , stm >= 2.2 && < 2.4
-                     , monadIO >= 0.10 && < 0.11
-                     , stm-chans >= 1.2 && < 1.4
-                     , text >= 0.11 && < 0.12
-                     , monad-control >= 0.3 && < 0.4
-                     , data-default >= 0.3 && < 0.6
-                     , directory >= 1.1 && < 1.2
-  Other-modules:      Paths_osm_download 
+                     , conduit >= 0.5
+                     , pool-conduit >= 0.1
+                     , http-conduit >= 1.2
+                     , http-types >= 0.6
+                     , bytestring >= 0.8
+                     , gps >= 1.2
+                     , monad-logger
+                     , containers >= 0.3
+                     , persistent-sqlite >= 1.0
+                     , persistent-template >= 1.0
+                     , persistent >= 1.0
+                     , mtl >= 2.0
+                     , transformers-base >= 0.4
+                     , transformers >= 0.2
+                     , time >= 1.2
+                     , stm >= 2.2
+                     , monadIO >= 0.10
+                     , stm-chans >= 1.2
+                     , text >= 0.11
+                     , monad-control >= 0.3
+                     , data-default >= 0.3
+                     , directory >= 1.1
+  Other-modules:      Paths_osm_download
   -- Extra tools (e.g. alex, hsc2hs, ...) needed to build the source.
   -- Build-tools:         
   

@@ -61,6 +61,7 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader (ask)
 import Control.Monad.State
 import Control.Monad.Trans.Control
+import Control.Monad.Logger
 import Database.Persist
 import Database.Persist.Sqlite hiding (get)
 import Database.Persist.TH
@@ -78,7 +79,7 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map as M
 import qualified Control.Exception as X
 
-import Debug.Trace
+import Network.OSM.Types
 
 -- FIXME zoom should be a newtype with Num instance that saturates (doesn't over/under flow)
 type Zoom = Int
@@ -90,21 +91,6 @@ osmTileURL = "http://tile.openstreetmap.org"
 -- |The coordinates associated with any particular GPS location
 -- can be computed using 'determineTileCoords' and converted into tile ids
 -- using 'selectedTiles' before final download with 'downloadTiles'.
-
--- | TileCoords describes the range of tiles needed to completely display an area
--- (the area must be rectangular).
-data TileCoords = TileCoords
-                     { minX :: Int
-                     , maxX :: Int
-                     , minY :: Int
-                     , maxY :: Int
-                     } deriving (Eq, Ord, Show)
-
--- |A TileID, along with a zoom level, uniquely identifies a single
--- OSM map tile.  The standard size is 256x256 pixels for such a tile.
-newtype TileID = TID { unTID :: (Int, Int) } deriving (Eq, Ord, Show, Read, Data, Typeable)
-
-derivePersistField "TileID"
 
 -- |OSM defined method of converting a coordinate and zoom level to a tile
 point2tile :: Point -> Zoom -> TileID
@@ -268,7 +254,8 @@ pixelPosForCoord wpt (TileCoords {..}) zoom =
       xoffset = (tx - fromIntegral minX) * 256
       yRange = fromIntegral $ maxY - minY
       yoffset = (ty - fromIntegral minY) * 256 - ( 1 - (ty - fromIntegral (floor ty))) * 256
-  in trace ("lat: " ++ show lat' ++ "\tlon: " ++ show lon' ++ "\ntx: " ++ show tx ++ "\tty: " ++ show ty ++ "\nminX: " ++ show minX ++ "\t minY: " ++ show minY ++ "\nmaxX: " ++ show maxX ++ "\tmaxY: " ++ show maxY ++ "\nxoffset: " ++ show xoffset ++ "\tyoffset: " ++ show yoffset) (truncate xoffset, truncate yoffset) -- (truncate xoffset, truncate yoffset)
+  in (truncate xoffset, truncate yoffset)
+      -- trace ("lat: " ++ show lat' ++ "\tlon: " ++ show lon' ++ "\ntx: " ++ show tx ++ "\tty: " ++ show ty ++ "\nminX: " ++ show minX ++ "\t minY: " ++ show minY ++ "\nmaxX: " ++ show maxX ++ "\tmaxY: " ++ show maxY ++ "\nxoffset: " ++ show xoffset ++ "\tyoffset: " ++ show yoffset) (truncate xoffset, truncate yoffset) 
 
 coordForPixelPos :: Integral t => (t,t) -> TileCoords -> Zoom -> Point
 coordForPixelPos (fromIntegral -> x,fromIntegral -> y) (TileCoords{..}) zoom =
@@ -335,10 +322,10 @@ data OSMState = OSMSt
                 , cfg         :: OSMConfig }
 
 -- |A Monad transformer allowing you acquire OSM maps
-newtype OSM a = OSM { runOSM :: StateT OSMState IO a }
+newtype OSM a = OSM { runOSM :: StateT OSMState (LoggingT (ResourceT IO)) a }
          deriving (Monad, MonadState OSMState)
 
-share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persist|
+share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
 TileEntry
     tileID TileID
     zoom   Zoom
@@ -350,10 +337,10 @@ TileEntry
 instance MonadIO OSM where
   liftIO = OSM . liftIO
 
-runDB :: SqlPersist IO a -> OSM a
+runDB :: SqlPersistT (LoggingT (ResourceT IO)) a -> OSM a
 runDB f = do
   p <- gets dbPool
-  v <- liftIO (X.catch (liftM Right $ runSqlPool f p) hdl)
+  v <- liftIO (X.catch (liftM Right $ runResourceT $ runStderrLoggingT $ runSqlPool f p) hdl)
   case v of
    Left e -> runDB f
    Right x -> return x
@@ -368,11 +355,11 @@ runDB f = do
 evalOSM :: OSM a -> OSMConfig -> IO a
 evalOSM m cfg = withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
   $ \conn -> do
-  runSqlPool (runMigration migrateAll) conn
+  runStderrLoggingT $ runSqlPool (runMigration migrateAll) conn
   tc <- liftIO $ newTBChanIO (nrQueuedDownloads cfg)
   liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg tc conn)
   let s = OSMSt tc conn cfg
-  evalStateT (runOSM m) s
+  runResourceT $ runStderrLoggingT $ evalStateT (runOSM m) s
 
 -- Pulls requested tiles off the queue, downloads them, and adds them
 -- to the cache.  We need to re-check the cache to make sure someone
@@ -387,7 +374,7 @@ monitorTileQueue cfg tc p = forever (X.catch go hdl)
  go :: IO ()
  go = do
   (t,z) <- atomically $ readTBChan tc
-  b     <- runSqlPool (getBy (TileCacheID t z)) p
+  b     <- runResourceT $ runStderrLoggingT $ runSqlPool (getBy (TileCacheID t z)) p
   case b of
     Nothing -> doDownload t z
     Just (Entity _ (TileEntry _ _ exp _)) -> do
@@ -397,8 +384,8 @@ monitorTileQueue cfg tc p = forever (X.catch go hdl)
  doDownload t z = do
      tileE <- downloadTileAndExprTime (baseUrl cfg) z t
      case tileE of
-       Left err -> return ()
-       Right (exp,bs)  -> runSqlPool (insertBy (TileEntry t z exp bs) >> return ()) p
+       Left err        -> return ()
+       Right (exp,bs)  -> runResourceT $ runStderrLoggingT $ runSqlPool (insertBy (TileEntry t z exp bs) >> return ()) p
 
 -- |A default configuration using the main OSM server as a tile server
 -- and a cabal-generated directory for the cache directory
@@ -462,6 +449,7 @@ getTile t zoom = do
       when exp (liftIO $ atomically (tryWriteTBChan ch (t,zoom)) >> return ())
       return (Right x)
   where
+    blockingTileDownloadUpdateCache :: OSM (Either Status B.ByteString)
     blockingTileDownloadUpdateCache = do
       net  <- gets (networkEnabled . cfg)
       base <- gets (baseUrl . cfg)
