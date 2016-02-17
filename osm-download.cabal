@@ -16,28 +16,29 @@ Cabal-version:       >=1.6
 Library
   Exposed-modules:     Network.OSM
   Build-depends:       base >= 4 && < 5
-                     , conduit >= 0.5
+                     , conduit >= 1.2
                      , pool-conduit >= 0.1
-                     , http-conduit >= 1.2
-                     , http-types >= 0.6
-                     , bytestring >= 0.8
+                     , http-conduit >= 2.1
+                     , http-types >= 0.9
+                     , bytestring >= 0.10
                      , gps >= 1.2
                      , monad-logger
-                     , containers >= 0.3
-                     , persistent-sqlite >= 1.0
-                     , persistent-template >= 1.0
-                     , persistent >= 1.0
-                     , mtl >= 2.0
+                     , containers >= 0.5
+                     , persistent-sqlite >= 2.2
+                     , persistent-template >= 2.1
+                     , persistent >= 2.2
+                     , mtl >= 2.2
                      , transformers-base >= 0.4
-                     , transformers >= 0.2
-                     , time >= 1.2
-                     , stm >= 2.2
+                     , transformers >= 0.4
+                     , resourcet
+                     , time >= 1.6
+                     , stm >= 2.4
                      , monadIO >= 0.10
-                     , stm-chans >= 1.2
-                     , text >= 0.11
-                     , monad-control >= 0.3
-                     , data-default >= 0.3
-                     , directory >= 1.1
+                     , stm-chans >= 3.0
+                     , text >= 1.2
+                     , monad-control < 1
+                     , data-default >= 0.5
+                     , directory >= 1.2
   Other-modules:      Paths_osm_download
   -- Extra tools (e.g. alex, hsc2hs, ...) needed to build the source.
   -- Build-tools:         

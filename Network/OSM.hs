@@ -7,11 +7,11 @@ module Network.OSM
     TileID(..)
   , TileCoords(..)
   , Zoom
-    -- * Types for tile cacheing
+    -- * Types for tile caching
   , OSMConfig(..)
   , OSMState
   , OSM
-    -- * High-level (cacheing) Operations
+    -- * High-level (caching) Operations
   , evalOSM
   , getBestFitTiles
   , getTiles
@@ -38,7 +38,7 @@ module Network.OSM
   , selectedTiles
   -- * Legal
   , osmCopyrightText
-  )where
+  ) where
 
 import Control.Monad
 import Control.Monad.Base (liftBase)
@@ -61,6 +61,7 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader (ask)
 import Control.Monad.State
 import Control.Monad.Trans.Control
+import Control.Monad.Trans.Resource
 import Control.Monad.Logger
 import Database.Persist
 import Database.Persist.Sqlite hiding (get)
@@ -133,9 +134,9 @@ tile2point (TID (fromIntegral -> x, fromIntegral -> y)) zoom =
 -- to a frame are from the lower left corner of the lower left tile of
 -- the grid that displays the frame.
 data Frame = Frame { width,height :: Int
-                     , center     :: Point
-                     , frameZoom  :: Zoom
-                     } deriving (Eq, Ord, Show, Read)
+                   , center       :: Point
+                   , frameZoom    :: Zoom
+                   } deriving (Eq, Ord, Show, Read)
 
 -- |Given a width, height and center, compute the tiles needed to fill
 -- the display.
@@ -224,13 +225,13 @@ urlStr base (TID (xTile, yTile)) zoom = base ++"/"++show zoom++"/"++show xTile++
 -- side-by-side display.
 downloadTiles :: String -> Zoom -> [[TileID]] -> IO [[Either Status B.ByteString]]
 downloadTiles base zoom ts = runResourceT $ do
-  man <- liftIO $ newManager def
+  man <- liftIO $ newManager tlsManagerSettings
   mapM (mapM (liftM (fmap snd) . downloadTile' man base zoom)) ts
 
 -- |Download a single tile form a given OSM server URL.
 downloadTile :: String -> Zoom -> TileID -> IO (Either Status B.ByteString)
 downloadTile base zoom t = runResourceT $ do
-  man <- liftIO $ newManager def
+  man <- liftIO $ newManager tlsManagerSettings
   liftM (fmap snd) (downloadTile' man base zoom t)
 
 downloadTile' :: Manager -> String -> Zoom -> TileID -> ResourceT IO (Either Status (ResponseHeaders,B.ByteString))
@@ -255,7 +256,6 @@ pixelPosForCoord wpt (TileCoords {..}) zoom =
       yRange = fromIntegral $ maxY - minY
       yoffset = (ty - fromIntegral minY) * 256 - ( 1 - (ty - fromIntegral (floor ty))) * 256
   in (truncate xoffset, truncate yoffset)
-      -- trace ("lat: " ++ show lat' ++ "\tlon: " ++ show lon' ++ "\ntx: " ++ show tx ++ "\tty: " ++ show ty ++ "\nminX: " ++ show minX ++ "\t minY: " ++ show minY ++ "\nmaxX: " ++ show maxX ++ "\tmaxY: " ++ show maxY ++ "\nxoffset: " ++ show xoffset ++ "\tyoffset: " ++ show yoffset) (truncate xoffset, truncate yoffset) 
 
 coordForPixelPos :: Integral t => (t,t) -> TileCoords -> Zoom -> Point
 coordForPixelPos (fromIntegral -> x,fromIntegral -> y) (TileCoords{..}) zoom =
@@ -323,7 +323,7 @@ data OSMState = OSMSt
 
 -- |A Monad transformer allowing you acquire OSM maps
 newtype OSM a = OSM { runOSM :: StateT OSMState (LoggingT (ResourceT IO)) a }
-         deriving (Monad, MonadState OSMState)
+         deriving (Monad, Applicative, Functor, MonadState OSMState)
 
 share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
 TileEntry
@@ -353,9 +353,9 @@ runDB f = do
 -- Running many evalOSM processes can result in a violation of the
 -- limit and incur admin wrath.
 evalOSM :: OSM a -> OSMConfig -> IO a
-evalOSM m cfg = withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
-  $ \conn -> do
-  runStderrLoggingT $ runSqlPool (runMigration migrateAll) conn
+evalOSM m cfg = runStderrLoggingT $ withSqlitePool (cache cfg) (2 * (nrConcurrentDownloads cfg + 1))
+  $ \conn -> LoggingT $ \_ -> do
+  runSqlPool (runMigration migrateAll) conn
   tc <- liftIO $ newTBChanIO (nrQueuedDownloads cfg)
   liftIO $ mapM_ forkIO $ replicate (nrConcurrentDownloads cfg) (monitorTileQueue cfg tc conn)
   let s = OSMSt tc conn cfg
@@ -416,7 +416,7 @@ downloadTileAndExprTime ::    String
                            -> TileID
                            -> IO (Either Status (UTCTime,B.ByteString))
 downloadTileAndExprTime base z t = do
-  res <- runResourceT $ liftIO (newManager def) >>= \m -> downloadTile' m base z t
+  res <- runResourceT $ liftIO (newManager tlsManagerSettings) >>= \m -> downloadTile' m base z t
   case res of
     Right (hdrs,bs) -> do
       now <- getCurrentTime
